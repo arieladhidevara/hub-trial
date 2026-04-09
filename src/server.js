@@ -784,6 +784,30 @@ function extractTextFromOutputItems(items) {
   return "";
 }
 
+function isLikelyHtmlDocument(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return false;
+  }
+  const start = text.slice(0, 400).toLowerCase();
+  return (
+    start.startsWith("<!doctype html") ||
+    start.startsWith("<html") ||
+    (start.includes("<html") && start.includes("<body"))
+  );
+}
+
+function isOpenClawStartupPayload(payload) {
+  const raw = String(payload?.__rawText || "").toLowerCase();
+  if (!raw) {
+    return false;
+  }
+  return (
+    raw.includes("<title>openclaw</title>") &&
+    (raw.includes("starting openclaw") || raw.includes("please wait while we set up your environment"))
+  );
+}
+
 function extractChatTextFromObject(payload) {
   if (!payload || typeof payload !== "object") {
     return "";
@@ -855,7 +879,11 @@ function extractChatTextFromPayload(payload) {
   }
 
   if (typeof payload.__rawText === "string" && payload.__rawText.trim()) {
-    return payload.__rawText.trim();
+    const rawText = payload.__rawText.trim();
+    if (isLikelyHtmlDocument(rawText)) {
+      return "";
+    }
+    return rawText;
   }
   return "";
 }
@@ -948,6 +976,9 @@ async function sendChatViaHttp(targetUrl, payload) {
     });
     const text = extractChatTextFromPayload(completion);
     if (!text) {
+      if (isOpenClawStartupPayload(completion)) {
+        throw new Error("OpenClaw masih starting. Coba lagi dalam 10-30 detik.");
+      }
       const info = describeOpenClawPayload(completion);
       throw new Error(
         info ? `OpenClaw response kosong (${info}).` : "OpenClaw response kosong."
@@ -974,6 +1005,9 @@ async function sendChatViaHttp(targetUrl, payload) {
     });
     const text = extractChatTextFromPayload(fallback);
     if (!text) {
+      if (isOpenClawStartupPayload(fallback)) {
+        throw new Error("OpenClaw masih starting. Coba lagi dalam 10-30 detik.");
+      }
       const info = describeOpenClawPayload(fallback);
       throw new Error(
         info ? `OpenClaw response kosong (${info}).` : "OpenClaw response kosong."
@@ -2343,7 +2377,13 @@ async function forwardChatToOpenClaw(localMessage, clientId) {
     } catch (error) {
       state.openclawLastError = String(error?.message || "OpenClaw HTTP chat error");
       broadcastConfig();
-      if (!state.openclawLastError.toLowerCase().includes("timeout")) {
+      const normalizedError = state.openclawLastError.toLowerCase();
+      const isTransientChatError =
+        normalizedError.includes("timeout") ||
+        normalizedError.includes("masih starting") ||
+        normalizedError.includes("starting openclaw") ||
+        normalizedError.includes("response kosong");
+      if (!isTransientChatError) {
         state.openclawConnected = false;
         state.openclawConnectedAt = 0;
         clearOpenClawHttpPoll();
