@@ -14,15 +14,7 @@ const OPENCLAW_AUTH_TOKEN_ENV = String(process.env.OPENCLAW_AUTH_TOKEN || "").tr
 const OPENCLAW_RECONNECT_MS = Number(process.env.OPENCLAW_RECONNECT_MS || 2000);
 const OPENCLAW_WS_HEARTBEAT_MS = Math.max(
   0,
-  Number(process.env.OPENCLAW_WS_HEARTBEAT_MS || 4000)
-);
-const OPENCLAW_UNSTABLE_CLOSE_MS = Math.max(
-  1000,
-  Number(process.env.OPENCLAW_UNSTABLE_CLOSE_MS || 12000)
-);
-const OPENCLAW_UNSTABLE_CLOSE_THRESHOLD = Math.max(
-  1,
-  Number(process.env.OPENCLAW_UNSTABLE_CLOSE_THRESHOLD || 2)
+  Number(process.env.OPENCLAW_WS_HEARTBEAT_MS || 0)
 );
 const OPENCLAW_DISCOVERY_TIMEOUT_MS = Number(
   process.env.OPENCLAW_DISCOVERY_TIMEOUT_MS || 1600
@@ -161,8 +153,6 @@ const state = {
   openclawAttempt: 0,
   openclawManualCloseSocket: null,
   openclawHeartbeat: null,
-  openclawHeartbeatTick: 0,
-  openclawUnstableCloseCounts: {},
   openclawCandidatesCache: [],
   proxyLastAction: settings.proxy.lastAction || null,
   dockerLastAction: settings.docker.lastAction || null
@@ -313,53 +303,6 @@ function mergeUniqueUrls(existing, additions) {
   return merged;
 }
 
-function toWsHost(hostname) {
-  const raw = String(hostname || "").trim();
-  if (!raw) {
-    return "";
-  }
-  if (raw.includes(":") && !raw.startsWith("[") && !raw.endsWith("]")) {
-    return `[${raw}]`;
-  }
-  return raw;
-}
-
-function buildOpenClawUrlVariants(urlValue) {
-  const variants = [];
-  const addVariant = (value) => {
-    try {
-      const candidate = sanitizeOpenClawUrl(value);
-      if (!candidate || variants.includes(candidate)) {
-        return;
-      }
-      variants.push(candidate);
-    } catch (_error) {
-      // ignore invalid candidate
-    }
-  };
-
-  let parsed = null;
-  try {
-    parsed = new URL(sanitizeOpenClawUrl(urlValue));
-  } catch (_error) {
-    return variants;
-  }
-
-  if (!["ws:", "wss:"].includes(parsed.protocol)) {
-    return variants;
-  }
-
-  const host = toWsHost(parsed.hostname || parsed.host);
-  if (!host) {
-    return variants;
-  }
-  addVariant(`${parsed.protocol}//${host}:43136`);
-  addVariant(`${parsed.protocol}//${host}:43136/ws/openclaw`);
-  addVariant(`${parsed.protocol}//${host}:8787/ws/openclaw`);
-
-  return variants;
-}
-
 function sendJson(socket, message) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return false;
@@ -440,13 +383,6 @@ function buildOpenClawCandidates() {
     addUrl(`ws://localhost:${ENV_OPENCLAW_PORT}${ENV_OPENCLAW_PATH}`);
   }
 
-  const seeds = urls.slice();
-  for (const seed of seeds) {
-    for (const variant of buildOpenClawUrlVariants(seed)) {
-      addUrl(variant);
-    }
-  }
-
   return urls;
 }
 
@@ -523,12 +459,10 @@ function sendSystemMessage(text) {
 
 function clearOpenClawHeartbeat() {
   if (!state.openclawHeartbeat) {
-    state.openclawHeartbeatTick = 0;
     return;
   }
   clearInterval(state.openclawHeartbeat);
   state.openclawHeartbeat = null;
-  state.openclawHeartbeatTick = 0;
 }
 
 function startOpenClawHeartbeat(socket, targetUrl) {
@@ -536,7 +470,6 @@ function startOpenClawHeartbeat(socket, targetUrl) {
   if (!socket || OPENCLAW_WS_HEARTBEAT_MS <= 0) {
     return;
   }
-  state.openclawHeartbeatTick = 0;
 
   state.openclawHeartbeat = setInterval(() => {
     if (!state.openclawSocket || state.openclawSocket !== socket) {
@@ -547,26 +480,7 @@ function startOpenClawHeartbeat(socket, targetUrl) {
       return;
     }
     try {
-      state.openclawHeartbeatTick += 1;
       socket.ping();
-      sendJson(socket, {
-        type: "ping",
-        payload: {
-          hubId: HUB_ID,
-          timestamp: toIsoNow(),
-          source: "hub-heartbeat"
-        }
-      });
-      if (state.agents.size === 0 || state.openclawHeartbeatTick % 3 === 0) {
-        sendJson(socket, {
-          type: "request_agents",
-          payload: {
-            hubId: HUB_ID,
-            source: "hub-heartbeat",
-            timestamp: toIsoNow()
-          }
-        });
-      }
     } catch (error) {
       state.openclawLastError = String(error?.message || "OpenClaw heartbeat error");
       log("OpenClaw heartbeat failed:", `${targetUrl} ${state.openclawLastError}`);
@@ -607,10 +521,20 @@ function handleOpenClawMessage(rawMessage) {
 
   const type = message.type || "unknown";
   const payload = message.payload || {};
+  const agentCollection = Array.isArray(payload.agents)
+    ? payload.agents
+    : Array.isArray(message.agents)
+      ? message.agents
+      : Array.isArray(payload)
+        ? payload
+        : null;
 
-  if (type === "agent_list" && Array.isArray(payload.agents)) {
+  if (
+    ["agent_list", "agents", "agent.snapshot", "agents_snapshot"].includes(String(type)) &&
+    Array.isArray(agentCollection)
+  ) {
     state.agents.clear();
-    for (const agent of payload.agents) {
+    for (const agent of agentCollection) {
       upsertAgent(agent);
     }
     broadcast({
@@ -622,7 +546,7 @@ function handleOpenClawMessage(rawMessage) {
     return;
   }
 
-  if (type === "agent_update") {
+  if (["agent_update", "agent", "presence"].includes(String(type))) {
     upsertAgent(payload.agent || payload);
     broadcast({
       type: "agent_list",
@@ -671,23 +595,7 @@ function pickNextOpenClawUrl(candidates) {
     return "";
   }
   if (settings.openclaw.url) {
-    const configuredUrl = settings.openclaw.url;
-    const unstableCloseCount = Number(state.openclawUnstableCloseCounts[configuredUrl] || 0);
-    if (unstableCloseCount < OPENCLAW_UNSTABLE_CLOSE_THRESHOLD) {
-      return configuredUrl;
-    }
-    const alternatives = candidates.filter((candidate) => candidate !== configuredUrl);
-    if (alternatives.length === 0) {
-      return configuredUrl;
-    }
-    const index = state.openclawAttempt % alternatives.length;
-    state.openclawAttempt += 1;
-    const fallbackUrl = alternatives[index];
-    log(
-      "Configured OpenClaw URL unstable, trying fallback:",
-      `${configuredUrl} -> ${fallbackUrl} (failures=${unstableCloseCount})`
-    );
-    return fallbackUrl;
+    return settings.openclaw.url;
   }
   const index = state.openclawAttempt % candidates.length;
   state.openclawAttempt += 1;
@@ -755,17 +663,7 @@ function connectToOpenClaw() {
     sendSystemMessage(`Hub connected to OpenClaw (${targetUrl})`);
     broadcastConfig();
     sendJson(ws, {
-      type: "hub_hello",
-      payload: {
-        hubId: HUB_ID,
-        timestamp: toIsoNow()
-      }
-    });
-    sendJson(ws, {
-      type: "request_agents",
-      payload: {
-        hubId: HUB_ID
-      }
+      type: "request_agents"
     });
   });
 
@@ -805,14 +703,6 @@ function connectToOpenClaw() {
     state.openclawSocket = null;
     clearOpenClawHeartbeat();
     const errorDetail = state.openclawLastError || reasonText;
-    const isUnstableClose =
-      code === 1005 && uptimeMs > 0 && uptimeMs <= OPENCLAW_UNSTABLE_CLOSE_MS;
-    if (isUnstableClose) {
-      const nextCount = Number(state.openclawUnstableCloseCounts[targetUrl] || 0) + 1;
-      state.openclawUnstableCloseCounts[targetUrl] = nextCount;
-    } else {
-      state.openclawUnstableCloseCounts[targetUrl] = 0;
-    }
 
     sendSystemMessage(
       errorDetail
@@ -822,9 +712,7 @@ function connectToOpenClaw() {
     broadcastConfig();
     log(
       "OpenClaw closed:",
-      `${code} ${reasonText || state.openclawLastError} (${targetUrl}) uptime=${uptimeMs}ms unstableCount=${
-        state.openclawUnstableCloseCounts[targetUrl] || 0
-      }`
+      `${code} ${reasonText || state.openclawLastError} (${targetUrl}) uptime=${uptimeMs}ms`
     );
     scheduleReconnect();
   });
@@ -1411,8 +1299,6 @@ function buildOpenClawDockerWsCandidates(containerName) {
 
   addCandidate(`ws://${containerName}:${OPENCLAW_DOCKER_GATEWAY_PORT}`);
   addCandidate(`ws://${containerName}:${OPENCLAW_DOCKER_GATEWAY_PORT}/ws/openclaw`);
-  addCandidate(`ws://${containerName}:8787/ws/openclaw`);
-  addCandidate(`ws://${containerName}:43136`);
 
   return candidates;
 }
@@ -1831,9 +1717,10 @@ function forwardChatToOpenClaw(localMessage, clientId) {
   if (!text) {
     return { ok: false, reason: "Pesan kosong." };
   }
+  const fallbackAgentId = serializeAgents()[0]?.id || "";
 
   const payload = {
-    agentId: String(localMessage.agentId || ""),
+    agentId: String(localMessage.agentId || fallbackAgentId),
     text,
     clientId,
     timestamp: toIsoNow()
