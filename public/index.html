@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hub Trial</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="background-glow"></div>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Mini Hub Tester</p>
+          <h1>Hub -> OpenClaw WS Chat</h1>
+        </div>
+        <span id="connectionBadge" class="badge badge-warn">Connecting...</span>
+      </header>
+
+      <section class="layout">
+        <aside class="agents-panel">
+          <div class="panel-head">
+            <h2>Agents</h2>
+            <button id="refreshAgentsBtn" class="small-btn" type="button">
+              Refresh
+            </button>
+          </div>
+          <div id="agentsList" class="agents-list"></div>
+
+          <section class="settings-panel">
+            <div class="panel-head">
+              <h2>OpenClaw Setup</h2>
+              <button id="discoverOpenclawBtn" class="small-btn" type="button">
+                Auto Discover
+              </button>
+            </div>
+            <p id="openclawSummary" class="panel-note">Loading setup...</p>
+            <div id="discoveryList" class="discovery-list"></div>
+
+            <label class="field-label" for="openclawUrlInput">OpenClaw WS URL</label>
+            <input
+              id="openclawUrlInput"
+              class="field-input"
+              type="text"
+              placeholder="ws://openclaw:8787/ws/openclaw"
+            />
+
+            <label class="field-label" for="openclawTokenInput">Token (optional)</label>
+            <input
+              id="openclawTokenInput"
+              class="field-input"
+              type="password"
+              placeholder="Paste bearer token (kosong = keep token lama)"
+            />
+
+            <div class="action-row">
+              <button id="saveConnectionBtn" class="small-btn strong-btn" type="button">
+                Save + Connect
+              </button>
+              <button id="clearTokenBtn" class="small-btn danger-btn" type="button">
+                Clear Token
+              </button>
+            </div>
+
+            <div class="action-row single-row">
+              <button id="dockerPairBtn" class="small-btn" type="button">
+                Auto Pair Docker OpenClaw
+              </button>
+            </div>
+            <p id="dockerSummary" class="panel-note">Docker auto-pair idle.</p>
+          </section>
+
+          <section class="settings-panel">
+            <div class="panel-head">
+              <h2>Proxy Manager</h2>
+              <button id="proxyAutoSetupBtn" class="small-btn" type="button">
+                Auto Setup
+              </button>
+            </div>
+            <p id="proxySummary" class="panel-note">No proxy action yet.</p>
+          </section>
+        </aside>
+
+        <section class="chat-panel">
+          <div id="messages" class="messages"></div>
+          <form id="chatForm" class="chat-form">
+            <input
+              id="chatInput"
+              name="message"
+              type="text"
+              autocomplete="off"
+              placeholder="Type a message for selected agent..."
+              required
+            />
+            <button id="sendBtn" type="submit">Send</button>
+          </form>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "name": "hub-trial",
+  "version": "0.1.0",
+  "description": "Mini Hub bridge from local chat UI to OpenClaw over WebSocket",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "mock:openclaw": "node src/mock-openclaw.js",
+    "local-ui": "node src/local-ui-server.js",
+    "local-ui:no-open": "LOCAL_UI_AUTO_OPEN=false node src/local-ui-server.js",
+    "check": "node --check src/server.js && node --check src/mock-openclaw.js && node --check src/local-ui-server.js && node --check public/app.js && node --check local-ui/app.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
+}

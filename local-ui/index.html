@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hub Local UI</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Local Client</p>
+          <h1>Connect Local UI to Hub VPS</h1>
+        </div>
+        <span id="connectionBadge" class="badge badge-warn">Disconnected</span>
+      </header>
+
+      <section class="settings-panel">
+        <div class="panel-head">
+          <h2>Hub Connection</h2>
+          <button id="hubConnectBtn" class="small-btn strong-btn" type="button">
+            Connect
+          </button>
+        </div>
+        <label class="field-label" for="hubUrlInput">Hub URL or VPS IP</label>
+        <input
+          id="hubUrlInput"
+          class="field-input"
+          type="text"
+          placeholder="127.0.0.1 (SSH tunnel) or 123.45.67.89:8080"
+        />
+        <label class="field-label">
+          <input id="useSshTunnelCheckbox" type="checkbox" checked />
+          Connect via SSH tunnel
+        </label>
+        <div class="action-row">
+          <div>
+            <label class="field-label" for="sshUserInput">SSH User</label>
+            <input id="sshUserInput" class="field-input" type="text" value="root" />
+          </div>
+          <div>
+            <label class="field-label" for="sshPortInput">SSH Port</label>
+            <input id="sshPortInput" class="field-input" type="number" value="22" min="1" />
+          </div>
+        </div>
+        <div class="action-row single-row">
+          <button id="disconnectTunnelBtn" class="small-btn danger-btn" type="button">
+            Disconnect SSH Tunnel
+          </button>
+        </div>
+        <p id="hubConnectHint" class="panel-note">
+          Paste VPS IP/URL, lalu Connect. If SSH tunnel aktif, cukup isi 127.0.0.1
+        </p>
+      </section>
+
+      <section class="layout">
+        <aside class="agents-panel">
+          <div class="panel-head">
+            <h2>Agents</h2>
+            <button id="refreshAgentsBtn" class="small-btn" type="button">
+              Refresh
+            </button>
+          </div>
+          <div id="agentsList" class="agents-list"></div>
+
+          <section class="settings-panel">
+            <div class="panel-head">
+              <h2>OpenClaw Setup</h2>
+              <button id="discoverOpenclawBtn" class="small-btn" type="button">
+                Auto Discover
+              </button>
+            </div>
+            <p id="openclawSummary" class="panel-note">Loading setup...</p>
+            <div id="discoveryList" class="discovery-list"></div>
+
+            <label class="field-label" for="openclawUrlInput">OpenClaw WS URL</label>
+            <input
+              id="openclawUrlInput"
+              class="field-input"
+              type="text"
+              placeholder="ws://openclaw:43136"
+            />
+
+            <label class="field-label" for="openclawTokenInput">OpenClaw Token</label>
+            <input
+              id="openclawTokenInput"
+              class="field-input"
+              type="password"
+              placeholder="Paste OpenClaw token"
+            />
+
+            <div class="action-row">
+              <button id="saveConnectionBtn" class="small-btn strong-btn" type="button">
+                Save + Connect
+              </button>
+              <button id="clearTokenBtn" class="small-btn danger-btn" type="button">
+                Clear Token
+              </button>
+            </div>
+
+            <div class="action-row single-row">
+              <button id="dockerPairBtn" class="small-btn" type="button">
+                Auto Pair Docker OpenClaw
+              </button>
+            </div>
+            <p id="dockerSummary" class="panel-note">Docker auto-pair idle.</p>
+          </section>
+        </aside>
+
+        <section class="chat-panel">
+          <div id="messages" class="messages"></div>
+          <form id="chatForm" class="chat-form">
+            <input
+              id="chatInput"
+              name="message"
+              type="text"
+              autocomplete="off"
+              placeholder="Type a message for selected agent..."
+              required
+            />
+            <button id="sendBtn" type="submit">Send</button>
+          </form>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

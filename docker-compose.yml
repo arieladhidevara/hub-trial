@@ -1,0 +1,15 @@
+services:
+  hub:
+    build: .
+    container_name: hub-trial
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"
+    volumes:
+      - hub_data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  hub_data:
