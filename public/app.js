@@ -490,13 +490,9 @@ chatForm.addEventListener("submit", (event) => {
   if (!text) {
     return;
   }
-  if (!state.selectedAgentId) {
-    appendError("Pilih agent dulu.");
-    return;
-  }
   sendMessage({
     type: "chat",
-    agentId: state.selectedAgentId,
+    agentId: state.selectedAgentId || "",
     text
   });
   chatInput.value = "";

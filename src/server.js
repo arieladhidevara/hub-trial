@@ -16,6 +16,14 @@ const OPENCLAW_WS_HEARTBEAT_MS = Math.max(
   0,
   Number(process.env.OPENCLAW_WS_HEARTBEAT_MS || 4000)
 );
+const OPENCLAW_UNSTABLE_CLOSE_MS = Math.max(
+  1000,
+  Number(process.env.OPENCLAW_UNSTABLE_CLOSE_MS || 12000)
+);
+const OPENCLAW_UNSTABLE_CLOSE_THRESHOLD = Math.max(
+  1,
+  Number(process.env.OPENCLAW_UNSTABLE_CLOSE_THRESHOLD || 2)
+);
 const OPENCLAW_DISCOVERY_TIMEOUT_MS = Number(
   process.env.OPENCLAW_DISCOVERY_TIMEOUT_MS || 1600
 );
@@ -149,9 +157,12 @@ const state = {
   openclawSocket: null,
   reconnectTimer: null,
   openclawTargetUrl: null,
+  openclawConnectedAt: 0,
   openclawAttempt: 0,
   openclawManualCloseSocket: null,
   openclawHeartbeat: null,
+  openclawHeartbeatTick: 0,
+  openclawUnstableCloseCounts: {},
   openclawCandidatesCache: [],
   proxyLastAction: settings.proxy.lastAction || null,
   dockerLastAction: settings.docker.lastAction || null
@@ -290,6 +301,65 @@ function sanitizeOpenClawUrl(url) {
   return candidate;
 }
 
+function mergeUniqueUrls(existing, additions) {
+  const merged = Array.isArray(existing) ? existing.slice() : [];
+  for (const item of Array.isArray(additions) ? additions : []) {
+    const value = String(item || "").trim();
+    if (!value || merged.includes(value)) {
+      continue;
+    }
+    merged.push(value);
+  }
+  return merged;
+}
+
+function toWsHost(hostname) {
+  const raw = String(hostname || "").trim();
+  if (!raw) {
+    return "";
+  }
+  if (raw.includes(":") && !raw.startsWith("[") && !raw.endsWith("]")) {
+    return `[${raw}]`;
+  }
+  return raw;
+}
+
+function buildOpenClawUrlVariants(urlValue) {
+  const variants = [];
+  const addVariant = (value) => {
+    try {
+      const candidate = sanitizeOpenClawUrl(value);
+      if (!candidate || variants.includes(candidate)) {
+        return;
+      }
+      variants.push(candidate);
+    } catch (_error) {
+      // ignore invalid candidate
+    }
+  };
+
+  let parsed = null;
+  try {
+    parsed = new URL(sanitizeOpenClawUrl(urlValue));
+  } catch (_error) {
+    return variants;
+  }
+
+  if (!["ws:", "wss:"].includes(parsed.protocol)) {
+    return variants;
+  }
+
+  const host = toWsHost(parsed.hostname || parsed.host);
+  if (!host) {
+    return variants;
+  }
+  addVariant(`${parsed.protocol}//${host}:43136`);
+  addVariant(`${parsed.protocol}//${host}:43136/ws/openclaw`);
+  addVariant(`${parsed.protocol}//${host}:8787/ws/openclaw`);
+
+  return variants;
+}
+
 function sendJson(socket, message) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return false;
@@ -370,6 +440,13 @@ function buildOpenClawCandidates() {
     addUrl(`ws://localhost:${ENV_OPENCLAW_PORT}${ENV_OPENCLAW_PATH}`);
   }
 
+  const seeds = urls.slice();
+  for (const seed of seeds) {
+    for (const variant of buildOpenClawUrlVariants(seed)) {
+      addUrl(variant);
+    }
+  }
+
   return urls;
 }
 
@@ -446,10 +523,12 @@ function sendSystemMessage(text) {
 
 function clearOpenClawHeartbeat() {
   if (!state.openclawHeartbeat) {
+    state.openclawHeartbeatTick = 0;
     return;
   }
   clearInterval(state.openclawHeartbeat);
   state.openclawHeartbeat = null;
+  state.openclawHeartbeatTick = 0;
 }
 
 function startOpenClawHeartbeat(socket, targetUrl) {
@@ -457,6 +536,7 @@ function startOpenClawHeartbeat(socket, targetUrl) {
   if (!socket || OPENCLAW_WS_HEARTBEAT_MS <= 0) {
     return;
   }
+  state.openclawHeartbeatTick = 0;
 
   state.openclawHeartbeat = setInterval(() => {
     if (!state.openclawSocket || state.openclawSocket !== socket) {
@@ -467,7 +547,26 @@ function startOpenClawHeartbeat(socket, targetUrl) {
       return;
     }
     try {
+      state.openclawHeartbeatTick += 1;
       socket.ping();
+      sendJson(socket, {
+        type: "ping",
+        payload: {
+          hubId: HUB_ID,
+          timestamp: toIsoNow(),
+          source: "hub-heartbeat"
+        }
+      });
+      if (state.agents.size === 0 || state.openclawHeartbeatTick % 3 === 0) {
+        sendJson(socket, {
+          type: "request_agents",
+          payload: {
+            hubId: HUB_ID,
+            source: "hub-heartbeat",
+            timestamp: toIsoNow()
+          }
+        });
+      }
     } catch (error) {
       state.openclawLastError = String(error?.message || "OpenClaw heartbeat error");
       log("OpenClaw heartbeat failed:", `${targetUrl} ${state.openclawLastError}`);
@@ -572,7 +671,23 @@ function pickNextOpenClawUrl(candidates) {
     return "";
   }
   if (settings.openclaw.url) {
-    return settings.openclaw.url;
+    const configuredUrl = settings.openclaw.url;
+    const unstableCloseCount = Number(state.openclawUnstableCloseCounts[configuredUrl] || 0);
+    if (unstableCloseCount < OPENCLAW_UNSTABLE_CLOSE_THRESHOLD) {
+      return configuredUrl;
+    }
+    const alternatives = candidates.filter((candidate) => candidate !== configuredUrl);
+    if (alternatives.length === 0) {
+      return configuredUrl;
+    }
+    const index = state.openclawAttempt % alternatives.length;
+    state.openclawAttempt += 1;
+    const fallbackUrl = alternatives[index];
+    log(
+      "Configured OpenClaw URL unstable, trying fallback:",
+      `${configuredUrl} -> ${fallbackUrl} (failures=${unstableCloseCount})`
+    );
+    return fallbackUrl;
   }
   const index = state.openclawAttempt % candidates.length;
   state.openclawAttempt += 1;
@@ -633,6 +748,7 @@ function connectToOpenClaw() {
     }
     state.openclawConnected = true;
     state.openclawLastError = "";
+    state.openclawConnectedAt = Date.now();
     state.openclawAttempt = 0;
     startOpenClawHeartbeat(ws, targetUrl);
     log("Connected to OpenClaw:", targetUrl);
@@ -669,6 +785,7 @@ function connectToOpenClaw() {
       state.openclawManualCloseSocket = null;
       if (isCurrentSocket) {
         state.openclawConnected = false;
+        state.openclawConnectedAt = 0;
         state.openclawSocket = null;
         clearOpenClawHeartbeat();
       }
@@ -683,9 +800,19 @@ function connectToOpenClaw() {
     }
 
     state.openclawConnected = false;
+    const uptimeMs = state.openclawConnectedAt > 0 ? Date.now() - state.openclawConnectedAt : 0;
+    state.openclawConnectedAt = 0;
     state.openclawSocket = null;
     clearOpenClawHeartbeat();
     const errorDetail = state.openclawLastError || reasonText;
+    const isUnstableClose =
+      code === 1005 && uptimeMs > 0 && uptimeMs <= OPENCLAW_UNSTABLE_CLOSE_MS;
+    if (isUnstableClose) {
+      const nextCount = Number(state.openclawUnstableCloseCounts[targetUrl] || 0) + 1;
+      state.openclawUnstableCloseCounts[targetUrl] = nextCount;
+    } else {
+      state.openclawUnstableCloseCounts[targetUrl] = 0;
+    }
 
     sendSystemMessage(
       errorDetail
@@ -695,7 +822,9 @@ function connectToOpenClaw() {
     broadcastConfig();
     log(
       "OpenClaw closed:",
-      `${code} ${reasonText || state.openclawLastError} (${targetUrl})`
+      `${code} ${reasonText || state.openclawLastError} (${targetUrl}) uptime=${uptimeMs}ms unstableCount=${
+        state.openclawUnstableCloseCounts[targetUrl] || 0
+      }`
     );
     scheduleReconnect();
   });
@@ -721,6 +850,8 @@ function reconnectToOpenClaw(reason) {
     } catch (_error) {
       state.openclawManualCloseSocket = null;
       if (state.openclawSocket === closingSocket) {
+        state.openclawConnected = false;
+        state.openclawConnectedAt = 0;
         state.openclawSocket = null;
       }
       connectToOpenClaw();
@@ -1406,7 +1537,11 @@ async function discoverOpenClawDockerUrl(options = {}) {
     const targetContainer = selectOpenClawContainer(rows);
     const networksFound = await inspectContainerNetworks(targetContainer.names);
     const selectedNetwork = pickContainerNetwork(networksFound);
+    const wsCandidates = buildOpenClawDockerWsCandidates(targetContainer.names);
     const wsUrl = buildOpenClawDockerWsUrl(targetContainer.names);
+    if (!wsCandidates.includes(wsUrl)) {
+      wsCandidates.unshift(wsUrl);
+    }
     const networkConnect = await tryConnectHubToNetwork(selectedNetwork);
 
     const previousUrl = settings.openclaw.url;
@@ -1415,11 +1550,21 @@ async function discoverOpenClawDockerUrl(options = {}) {
       !previousUrl ||
       isLegacyOpenClawUrl(previousUrl) ||
       previousUrl.includes("loopback-proxy");
+    const mergedCandidates = mergeUniqueUrls(settings.openclaw.candidates, wsCandidates);
+    const candidatesChanged =
+      mergedCandidates.length !== (Array.isArray(settings.openclaw.candidates) ? settings.openclaw.candidates.length : 0);
+    if (candidatesChanged) {
+      settings.openclaw.candidates = mergedCandidates;
+    }
     if (shouldUpdate && wsUrl) {
       settings.openclaw.url = wsUrl;
+    }
+    const effectiveUrl = settings.openclaw.url || wsUrl;
+    const urlChanged = previousUrl !== effectiveUrl;
+    if ((shouldUpdate && wsUrl) || candidatesChanged) {
       saveSettings();
     }
-    if (reconnect && (settings.openclaw.url === wsUrl || shouldUpdate)) {
+    if (reconnect && (urlChanged || !state.openclawConnected)) {
       reconnectToOpenClaw("docker url discovery");
     }
 
@@ -1433,7 +1578,8 @@ async function discoverOpenClawDockerUrl(options = {}) {
       networksFound,
       networkUsed: selectedNetwork,
       wsUrl,
-      updated: shouldUpdate,
+      updated: urlChanged,
+      candidateUrls: wsCandidates,
       networkConnect
     };
     saveDockerAction(result);
@@ -1627,9 +1773,15 @@ async function runOpenClawDockerPairing(options = {}) {
       throw new Error(`Gateway probe gagal untuk semua candidate URL.${details}`);
     }
 
+    const previousUrl = settings.openclaw.url;
     settings.openclaw.url = wsUrl;
+    settings.openclaw.candidates = mergeUniqueUrls(settings.openclaw.candidates, wsCandidates);
     saveSettings();
-    reconnectToOpenClaw("docker auto pairing");
+    const shouldReconnect =
+      previousUrl !== wsUrl || !state.openclawConnected || state.openclawTargetUrl !== wsUrl;
+    if (shouldReconnect) {
+      reconnectToOpenClaw("docker auto pairing");
+    }
 
     const ok = {
       ok: true,
