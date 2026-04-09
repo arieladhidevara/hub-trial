@@ -69,7 +69,7 @@ const DOCKER_AUTOMATION_AUTO_PAIR_ON_STARTUP = parseBoolean(
   true
 );
 const DOCKER_BIN = String(process.env.DOCKER_BIN || "docker").trim() || "docker";
-const DOCKER_COMMAND_TIMEOUT_MS = Number(process.env.DOCKER_COMMAND_TIMEOUT_MS || 12000);
+const DOCKER_COMMAND_TIMEOUT_MS = Number(process.env.DOCKER_COMMAND_TIMEOUT_MS || 20000);
 const OPENCLAW_DOCKER_CONTAINER_NAME = String(
   process.env.OPENCLAW_DOCKER_CONTAINER_NAME || ""
 ).trim();
@@ -1039,6 +1039,11 @@ function redactCommandArgs(args) {
   return masked;
 }
 
+function isNoPendingDeviceApproveError(error) {
+  const text = String(error?.message || "").toLowerCase();
+  return text.includes("no pending device pairing requests to approve");
+}
+
 function runProcess(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
@@ -1224,6 +1229,30 @@ function buildOpenClawDockerWsUrl(containerName) {
     return sanitizeOpenClawUrl(OPENCLAW_DOCKER_WS_URL);
   }
   return `ws://${containerName}:${OPENCLAW_DOCKER_GATEWAY_PORT}`;
+}
+
+function buildOpenClawDockerWsCandidates(containerName) {
+  if (OPENCLAW_DOCKER_WS_URL) {
+    return [sanitizeOpenClawUrl(OPENCLAW_DOCKER_WS_URL)];
+  }
+  const candidates = [];
+  const addCandidate = (value) => {
+    try {
+      const sanitized = sanitizeOpenClawUrl(value);
+      if (!candidates.includes(sanitized)) {
+        candidates.push(sanitized);
+      }
+    } catch (_error) {
+      // ignore invalid candidate
+    }
+  };
+
+  addCandidate(`ws://${containerName}:${OPENCLAW_DOCKER_GATEWAY_PORT}`);
+  addCandidate(`ws://${containerName}:${OPENCLAW_DOCKER_GATEWAY_PORT}/ws/openclaw`);
+  addCandidate(`ws://${containerName}:8787/ws/openclaw`);
+  addCandidate(`ws://${containerName}:43136`);
+
+  return candidates;
 }
 
 async function inspectContainerNetworks(containerName) {
@@ -1451,9 +1480,16 @@ async function runOpenClawDockerPairing(options = {}) {
       throw new Error(`Container ${targetContainer.names} tidak punya network yang usable.`);
     }
     const networkConnect = await tryConnectHubToNetwork(selectedNetwork);
-    const wsUrl = buildOpenClawDockerWsUrl(targetContainer.names);
+    const wsCandidates = buildOpenClawDockerWsCandidates(targetContainer.names);
+    const preferredWsUrl = buildOpenClawDockerWsUrl(targetContainer.names);
+    if (!wsCandidates.includes(preferredWsUrl)) {
+      wsCandidates.unshift(preferredWsUrl);
+    }
+    if (wsCandidates.length === 0) {
+      throw new Error(`Tidak ada candidate OpenClaw WS URL untuk container ${targetContainer.names}.`);
+    }
 
-    const runGatewayProbe = async () => {
+    const runGatewayProbe = async (targetWsUrl) => {
       const probeContainerName = `hub-openclaw-probe-${Date.now()}`;
       const probeArgs = [
         "run",
@@ -1478,7 +1514,7 @@ async function runOpenClawDockerPairing(options = {}) {
         "gateway",
         "probe",
         "--url",
-        wsUrl,
+        targetWsUrl,
         "--token",
         token,
         "--timeout",
@@ -1506,30 +1542,58 @@ async function runOpenClawDockerPairing(options = {}) {
       );
     };
 
-    let probeResult = null;
-    let firstProbeError = null;
-    try {
-      probeResult = await runGatewayProbe();
-    } catch (error) {
-      firstProbeError = error;
-    }
-
     let approveResult = null;
-    if (OPENCLAW_DOCKER_AUTO_APPROVE) {
-      approveResult = await runDevicesApproveLatest();
+    let probeResult = null;
+    let wsUrl = "";
+    const probeFailures = [];
+
+    const tryProbeCandidates = async (stage) => {
+      for (const candidateUrl of wsCandidates) {
+        try {
+          const result = await runGatewayProbe(candidateUrl);
+          return {
+            wsUrl: candidateUrl,
+            probeResult: result
+          };
+        } catch (error) {
+          probeFailures.push(
+            `${stage} ${candidateUrl}: ${truncateText(String(error?.message || "probe failed"), 600)}`
+          );
+        }
+      }
+      return null;
+    };
+
+    const firstProbe = await tryProbeCandidates("probe");
+    if (firstProbe) {
+      wsUrl = firstProbe.wsUrl;
+      probeResult = firstProbe.probeResult;
+    } else if (OPENCLAW_DOCKER_AUTO_APPROVE) {
+      try {
+        approveResult = await runDevicesApproveLatest();
+      } catch (error) {
+        if (isNoPendingDeviceApproveError(error)) {
+          approveResult = {
+            stdout: "",
+            stderr: "No pending device pairing requests to approve",
+            elapsedMs: 0,
+            skippedNoPending: true
+          };
+        } else {
+          throw error;
+        }
+      }
+
+      const secondProbe = await tryProbeCandidates("probe-after-approve");
+      if (secondProbe) {
+        wsUrl = secondProbe.wsUrl;
+        probeResult = secondProbe.probeResult;
+      }
     }
 
-    if (!probeResult) {
-      if (!OPENCLAW_DOCKER_AUTO_APPROVE) {
-        throw firstProbeError || new Error("Gateway probe gagal.");
-      }
-      try {
-        probeResult = await runGatewayProbe();
-      } catch (secondProbeError) {
-        const firstMsg = firstProbeError ? `Probe awal gagal: ${firstProbeError.message}` : "";
-        const secondMsg = `Probe ulang setelah approve gagal: ${secondProbeError.message}`;
-        throw new Error([firstMsg, secondMsg].filter(Boolean).join(" | "));
-      }
+    if (!probeResult || !wsUrl) {
+      const details = probeFailures.length ? ` Details: ${probeFailures.join(" | ")}` : "";
+      throw new Error(`Gateway probe gagal untuk semua candidate URL.${details}`);
     }
 
     settings.openclaw.url = wsUrl;
@@ -1548,11 +1612,14 @@ async function runOpenClawDockerPairing(options = {}) {
       networkConnect,
       wsUrl,
       probe: {
+        candidateUrls: wsCandidates,
+        selectedUrl: wsUrl,
         stdout: truncateText(probeResult.stdout, 1600),
         stderr: truncateText(probeResult.stderr, 800)
       },
       approve: approveResult
         ? {
+            skippedNoPending: approveResult.skippedNoPending === true,
             stdout: truncateText(approveResult.stdout, 1600),
             stderr: truncateText(approveResult.stderr, 800)
           }
