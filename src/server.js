@@ -1013,9 +1013,12 @@ function runProcess(command, args, options = {}) {
         elapsedMs
       };
       if (code !== 0) {
+        const argText = Array.isArray(args) ? args.join(" ") : "";
+        const stderrText = truncateText(result.stderr || "(empty)");
+        const stdoutText = truncateText(result.stdout || "(empty)");
         done(
           new Error(
-            `Command "${command}" exit ${code}. stderr: ${truncateText(result.stderr || "(empty)")}`
+            `Command "${command} ${argText}" exit ${code}. stderr: ${stderrText}; stdout: ${stdoutText}`
           )
         );
         return;
@@ -1045,18 +1048,59 @@ function parseDockerPsOutput(stdout) {
     .map((line) => line.trim())
     .filter(Boolean);
   for (const line of lines) {
-    const parsed = safeParse(line);
-    if (!parsed) {
+    const parts = line.split("|");
+    if (parts.length < 4) {
       continue;
     }
+    const [id, image, names, ...statusParts] = parts;
     rows.push({
-      id: String(parsed.ID || "").trim(),
-      image: String(parsed.Image || "").trim(),
-      names: String(parsed.Names || "").trim(),
-      status: String(parsed.Status || "").trim()
+      id: String(id || "").trim(),
+      image: String(image || "").trim(),
+      names: String(names || "").trim(),
+      status: String(statusParts.join("|") || "").trim()
     });
   }
   return rows;
+}
+
+function isProxyLikeOpenClawContainer(row) {
+  const text = `${String(row?.names || "")} ${String(row?.image || "")}`.toLowerCase();
+  return (
+    text.includes("loopback-proxy") ||
+    text.includes("gateway-proxy") ||
+    text.includes("-proxy-")
+  );
+}
+
+function scoreOpenClawContainer(row) {
+  const name = String(row?.names || "").toLowerCase();
+  const image = String(row?.image || "").toLowerCase();
+  const status = String(row?.status || "").toLowerCase();
+  let score = 0;
+
+  if (/openclaw.*-openclaw-\d+$/.test(name)) {
+    score += 80;
+  }
+  if (name.endsWith("-openclaw-1")) {
+    score += 40;
+  }
+  if (name === "openclaw") {
+    score += 35;
+  }
+  if (name.includes("-openclaw-")) {
+    score += 20;
+  }
+  if (image.includes("hvps-openclaw")) {
+    score += 25;
+  }
+  if (status.includes("up")) {
+    score += 10;
+  }
+  if (isProxyLikeOpenClawContainer(row)) {
+    score -= 200;
+  }
+
+  return score;
 }
 
 function selectOpenClawContainer(rows) {
@@ -1087,9 +1131,16 @@ function selectOpenClawContainer(rows) {
     );
   }
 
-  matched.sort((a, b) => a.names.localeCompare(b.names));
-  const preferred = matched.find((row) => row.names.includes("-openclaw-")) || matched[0];
-  return preferred;
+  const primary = matched.filter((row) => !isProxyLikeOpenClawContainer(row));
+  const pool = primary.length > 0 ? primary : matched;
+  pool.sort((a, b) => {
+    const scoreDiff = scoreOpenClawContainer(b) - scoreOpenClawContainer(a);
+    if (scoreDiff !== 0) {
+      return scoreDiff;
+    }
+    return a.names.localeCompare(b.names);
+  });
+  return pool[0];
 }
 
 function buildOpenClawDockerWsUrl(containerName) {
@@ -1100,15 +1151,18 @@ function buildOpenClawDockerWsUrl(containerName) {
 }
 
 async function inspectContainerNetworks(containerName) {
-  const result = await runDockerCommand(
-    ["inspect", containerName, "--format", "{{json .NetworkSettings.Networks}}"],
-    { timeoutMs: DOCKER_COMMAND_TIMEOUT_MS }
-  );
+  const result = await runDockerCommand(["inspect", containerName], {
+    timeoutMs: DOCKER_COMMAND_TIMEOUT_MS
+  });
   const parsed = safeParse(result.stdout);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+  if (!Array.isArray(parsed) || parsed.length === 0) {
     throw new Error(`Gagal baca network untuk container ${containerName}.`);
   }
-  return Object.keys(parsed);
+  const networks = parsed[0]?.NetworkSettings?.Networks;
+  if (!networks || typeof networks !== "object") {
+    throw new Error(`Container ${containerName} tidak punya NetworkSettings.Networks.`);
+  }
+  return Object.keys(networks);
 }
 
 function pickContainerNetwork(networkNames) {
@@ -1129,6 +1183,140 @@ function pickContainerNetwork(networkNames) {
     return normalized !== "bridge" && normalized !== "host" && normalized !== "none";
   });
   return preferred || names[0];
+}
+
+function isLegacyOpenClawUrl(urlValue) {
+  const value = String(urlValue || "").trim().toLowerCase();
+  if (!value) {
+    return true;
+  }
+  return (
+    value.includes(":8787/ws/openclaw") ||
+    value.includes("loopback-proxy") ||
+    value === "ws://openclaw:8787/ws/openclaw"
+  );
+}
+
+async function tryConnectHubToNetwork(networkName) {
+  const targetNetwork = String(networkName || "").trim();
+  if (!targetNetwork) {
+    return {
+      attempted: false,
+      message: "network kosong"
+    };
+  }
+  const selfId = String(process.env.HOSTNAME || "").trim() || "hub-trial";
+  try {
+    await runDockerCommand(["network", "connect", targetNetwork, selfId], {
+      timeoutMs: DOCKER_COMMAND_TIMEOUT_MS
+    });
+    return {
+      attempted: true,
+      connected: true,
+      container: selfId
+    };
+  } catch (error) {
+    const msg = String(error.message || "");
+    if (
+      msg.toLowerCase().includes("already exists") ||
+      msg.toLowerCase().includes("already connected")
+    ) {
+      return {
+        attempted: true,
+        connected: true,
+        container: selfId,
+        alreadyConnected: true
+      };
+    }
+    return {
+      attempted: true,
+      connected: false,
+      container: selfId,
+      message: msg
+    };
+  }
+}
+
+async function discoverOpenClawDockerUrl(options = {}) {
+  const trigger = String(options.trigger || "manual-discovery");
+  const startedAt = toIsoNow();
+  const force = options.force === true;
+  const reconnect = options.reconnect !== false;
+
+  if (!DOCKER_AUTOMATION_ENABLED) {
+    const skipped = {
+      ok: false,
+      status: "skipped",
+      trigger,
+      startedAt,
+      finishedAt: toIsoNow(),
+      message: "Docker automation disabled. Set DOCKER_AUTOMATION_ENABLED=true."
+    };
+    saveDockerAction(skipped);
+    return skipped;
+  }
+
+  try {
+    const psResult = await runDockerCommand(
+      [
+        "ps",
+        "--no-trunc",
+        "--format",
+        "{{.ID}}|{{.Image}}|{{.Names}}|{{.Status}}"
+      ],
+      { timeoutMs: DOCKER_COMMAND_TIMEOUT_MS }
+    );
+    const rows = parseDockerPsOutput(psResult.stdout);
+    const targetContainer = selectOpenClawContainer(rows);
+    const networksFound = await inspectContainerNetworks(targetContainer.names);
+    const selectedNetwork = pickContainerNetwork(networksFound);
+    const wsUrl = buildOpenClawDockerWsUrl(targetContainer.names);
+    const networkConnect = await tryConnectHubToNetwork(selectedNetwork);
+
+    const previousUrl = settings.openclaw.url;
+    const shouldUpdate =
+      force ||
+      !previousUrl ||
+      isLegacyOpenClawUrl(previousUrl) ||
+      previousUrl.includes("loopback-proxy");
+    if (shouldUpdate && wsUrl) {
+      settings.openclaw.url = wsUrl;
+      saveSettings();
+    }
+    if (reconnect && (settings.openclaw.url === wsUrl || shouldUpdate)) {
+      reconnectToOpenClaw("docker url discovery");
+    }
+
+    const result = {
+      ok: true,
+      status: "detected",
+      trigger,
+      startedAt,
+      finishedAt: toIsoNow(),
+      container: targetContainer,
+      networksFound,
+      networkUsed: selectedNetwork,
+      wsUrl,
+      updated: shouldUpdate,
+      networkConnect
+    };
+    saveDockerAction(result);
+    if (shouldUpdate) {
+      sendSystemMessage(`OpenClaw URL auto-detected: ${wsUrl}`);
+    }
+    return result;
+  } catch (error) {
+    const failed = {
+      ok: false,
+      status: "error",
+      trigger,
+      startedAt,
+      finishedAt: toIsoNow(),
+      message: error.message
+    };
+    saveDockerAction(failed);
+    return failed;
+  }
 }
 
 function saveDockerAction(result) {
@@ -1170,9 +1358,15 @@ async function runOpenClawDockerPairing(options = {}) {
   }
 
   try {
-    const psResult = await runDockerCommand(["ps", "--format", "{{json .}}"], {
-      timeoutMs: DOCKER_COMMAND_TIMEOUT_MS
-    });
+    const psResult = await runDockerCommand(
+      [
+        "ps",
+        "--no-trunc",
+        "--format",
+        "{{.ID}}|{{.Image}}|{{.Names}}|{{.Status}}"
+      ],
+      { timeoutMs: DOCKER_COMMAND_TIMEOUT_MS }
+    );
     const rows = parseDockerPsOutput(psResult.stdout);
     const targetContainer = selectOpenClawContainer(rows);
     const networksFound = await inspectContainerNetworks(targetContainer.names);
@@ -1180,6 +1374,7 @@ async function runOpenClawDockerPairing(options = {}) {
     if (!selectedNetwork) {
       throw new Error(`Container ${targetContainer.names} tidak punya network yang usable.`);
     }
+    const networkConnect = await tryConnectHubToNetwork(selectedNetwork);
     const wsUrl = buildOpenClawDockerWsUrl(targetContainer.names);
 
     const probeContainerName = `hub-openclaw-probe-${Date.now()}`;
@@ -1247,6 +1442,7 @@ async function runOpenClawDockerPairing(options = {}) {
       container: targetContainer,
       networksFound,
       networkUsed: selectedNetwork,
+      networkConnect,
       wsUrl,
       probe: {
         stdout: truncateText(probeResult.stdout, 1600),
@@ -1355,6 +1551,7 @@ app.post("/api/config/openclaw", async (req, res) => {
   const previousUrl = settings.openclaw.url;
   const previousToken = settings.openclaw.token;
   const requestedAutoPair = body.autoPair === true;
+  let tokenProvided = false;
 
   if (Object.prototype.hasOwnProperty.call(body, "url")) {
     settings.openclaw.url = sanitizeOpenClawUrl(body.url);
@@ -1369,18 +1566,34 @@ app.post("/api/config/openclaw", async (req, res) => {
     const incomingToken = String(body.token || "").trim();
     if (incomingToken) {
       settings.openclaw.token = incomingToken;
+      tokenProvided = true;
     }
   }
 
   saveSettings();
   broadcastConfig();
 
+  let dockerDiscoveryResult = null;
+  const shouldTryDockerUrlDiscovery =
+    DOCKER_AUTOMATION_ENABLED &&
+    (requestedAutoPair ||
+      tokenProvided ||
+      !settings.openclaw.url ||
+      isLegacyOpenClawUrl(settings.openclaw.url));
+  if (shouldTryDockerUrlDiscovery) {
+    dockerDiscoveryResult = await discoverOpenClawDockerUrl({
+      trigger: "config-save",
+      force: !settings.openclaw.url || isLegacyOpenClawUrl(settings.openclaw.url),
+      reconnect: false
+    });
+  }
+
   let dockerPairResult = null;
   const hasTokenAfterSave = Boolean(getCurrentOpenClawToken());
   const shouldTryDockerPair =
     DOCKER_AUTOMATION_ENABLED &&
     hasTokenAfterSave &&
-    (requestedAutoPair || !settings.openclaw.url);
+    (requestedAutoPair || tokenProvided || !settings.openclaw.url);
   if (shouldTryDockerPair) {
     dockerPairResult = await runOpenClawDockerPairing({
       trigger: "config-save"
@@ -1403,6 +1616,7 @@ app.post("/api/config/openclaw", async (req, res) => {
   res.json({
     ok: true,
     config: getPublicConfig(req.headers),
+    dockerDiscovery: dockerDiscoveryResult,
     dockerPair: dockerPairResult
   });
 });
@@ -1430,6 +1644,22 @@ app.get("/api/proxy/discovery", (req, res) => {
 app.post("/api/docker/auto-pair", async (req, res) => {
   const result = await runOpenClawDockerPairing({
     trigger: "api"
+  });
+  const statusCode = result.ok ? 200 : result.status === "skipped" ? 200 : 500;
+  res.status(statusCode).json({
+    ok: result.ok,
+    result,
+    config: getPublicConfig(req.headers)
+  });
+});
+
+app.post("/api/docker/discover-url", async (req, res) => {
+  const force = req.body?.force === true;
+  const reconnect = req.body?.reconnect !== false;
+  const result = await discoverOpenClawDockerUrl({
+    trigger: "api-discover-url",
+    force,
+    reconnect
   });
   const statusCode = result.ok ? 200 : result.status === "skipped" ? 200 : 500;
   res.status(statusCode).json({
@@ -1534,6 +1764,15 @@ localWss.on("connection", (socket, request) => {
 });
 
 async function startupFlow() {
+  if (DOCKER_AUTOMATION_ENABLED) {
+    log("Running startup Docker URL discovery...");
+    await discoverOpenClawDockerUrl({
+      trigger: "startup",
+      force: isLegacyOpenClawUrl(settings.openclaw.url),
+      reconnect: false
+    });
+  }
+
   if (DOCKER_AUTOMATION_ENABLED && DOCKER_AUTOMATION_AUTO_PAIR_ON_STARTUP) {
     log("Running startup Docker auto-pair...");
     await runOpenClawDockerPairing({

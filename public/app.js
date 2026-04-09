@@ -21,6 +21,7 @@ const proxySummary = document.getElementById("proxySummary");
 const state = {
   socket: null,
   reconnectTimer: null,
+  autoDockerUrlDiscoveryTried: false,
   selectedAgentId: null,
   agentsById: new Map(),
   config: null
@@ -248,6 +249,29 @@ async function loadConfig() {
   }
 }
 
+async function autoDiscoverDockerUrl() {
+  if (state.autoDockerUrlDiscoveryTried) {
+    return;
+  }
+  state.autoDockerUrlDiscoveryTried = true;
+  try {
+    const response = await apiRequest("/api/docker/discover-url", {
+      method: "POST",
+      body: {
+        force: false,
+        reconnect: true
+      }
+    });
+    renderConfig(response.config || {});
+    const wsUrlValue = response.result?.wsUrl || "";
+    if (wsUrlValue) {
+      appendSystem(`OpenClaw URL auto-detected: ${wsUrlValue}`);
+    }
+  } catch (error) {
+    appendError(`Auto detect OpenClaw URL gagal: ${error.message}`);
+  }
+}
+
 async function discoverOpenClaw() {
   discoverOpenclawBtn.disabled = true;
   discoverOpenclawBtn.textContent = "Scanning...";
@@ -282,6 +306,9 @@ async function saveOpenClawConfig() {
       payload.token = token;
     }
     if (!url) {
+      payload.autoPair = true;
+    }
+    if (token) {
       payload.autoPair = true;
     }
     const response = await apiRequest("/api/config/openclaw", {
@@ -383,6 +410,7 @@ async function runDockerAutoPair() {
 
 function connect() {
   clearTimeout(state.reconnectTimer);
+  state.autoDockerUrlDiscoveryTried = false;
   setBadge("Connecting...", "warn");
 
   const socket = new WebSocket(wsUrl());
@@ -394,6 +422,7 @@ function connect() {
     sendMessage({ type: "request_agents" });
     sendMessage({ type: "request_config" });
     loadConfig();
+    autoDiscoverDockerUrl();
   });
 
   socket.addEventListener("message", (event) => {
