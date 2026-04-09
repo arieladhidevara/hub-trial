@@ -490,6 +490,50 @@ function wsUrlToHttpBaseUrl(wsUrl) {
   return `${protocol}//${parsed.host}`;
 }
 
+function parseJsonEventStreamFrames(rawBody) {
+  const rawText = String(rawBody || "");
+  if (!rawText) {
+    return [];
+  }
+  const events = [];
+  const lines = rawText.split(/\r?\n/);
+  let dataLines = [];
+
+  const flush = () => {
+    if (dataLines.length === 0) {
+      return;
+    }
+    const data = dataLines.join("\n").trim();
+    dataLines = [];
+    if (!data || data === "[DONE]") {
+      return;
+    }
+    const parsed = safeParse(data);
+    if (parsed && typeof parsed === "object") {
+      events.push(parsed);
+    }
+  };
+
+  for (const line of lines) {
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trimStart());
+      continue;
+    }
+    if (!line.trim()) {
+      flush();
+      continue;
+    }
+    if (line.startsWith(":")) {
+      continue;
+    }
+    if (dataLines.length > 0) {
+      dataLines.push(line.trim());
+    }
+  }
+  flush();
+  return events;
+}
+
 async function openClawFetchJson(targetWsUrl, apiPath, options = {}) {
   const token = getCurrentOpenClawToken();
   if (!token) {
@@ -502,17 +546,21 @@ async function openClawFetchJson(targetWsUrl, apiPath, options = {}) {
   const url = `${baseUrl}${normalizedPath}`;
   const method = String(options.method || "GET").toUpperCase();
   const timeoutMs = Number(options.timeoutMs || OPENCLAW_HTTP_TIMEOUT_MS);
+  const allowNonJson = options.allowNonJson === true;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
 
   try {
+    const extraHeaders = options.headers && typeof options.headers === "object" ? options.headers : {};
     const response = await fetch(url, {
       method,
       headers: {
         authorization: `Bearer ${token}`,
-        "content-type": "application/json"
+        accept: allowNonJson ? "application/json, text/event-stream" : "application/json",
+        "content-type": "application/json",
+        ...extraHeaders
       },
       body: options.body ? JSON.stringify(options.body) : undefined,
       signal: controller.signal
@@ -523,6 +571,23 @@ async function openClawFetchJson(targetWsUrl, apiPath, options = {}) {
       parsed = raw ? JSON.parse(raw) : null;
     } catch (_error) {
       parsed = null;
+    }
+    if (!parsed && raw && allowNonJson) {
+      const events = parseJsonEventStreamFrames(raw);
+      if (events.length > 0) {
+        parsed = {
+          __sseEvents: events
+        };
+      } else {
+        parsed = {
+          __rawText: raw
+        };
+      }
+    }
+    if (!parsed && raw && !allowNonJson && response.ok) {
+      throw new Error(
+        `OpenClaw API ${normalizedPath} response bukan JSON: ${truncateText(raw, 300)}`
+      );
     }
     if (!response.ok) {
       const detail =
@@ -665,51 +730,209 @@ async function connectToOpenClawViaHttp(targetUrl) {
   }
 }
 
-function extractChatTextFromPayload(payload) {
+function extractTextFromContentPart(part) {
+  if (typeof part === "string") {
+    return part;
+  }
+  if (!part || typeof part !== "object") {
+    return "";
+  }
+  if (typeof part.text === "string") {
+    return part.text;
+  }
+  if (part.text && typeof part.text === "object" && typeof part.text.value === "string") {
+    return part.text.value;
+  }
+  if (typeof part.output_text === "string") {
+    return part.output_text;
+  }
+  if (typeof part.delta === "string") {
+    return part.delta;
+  }
+  if (typeof part.value === "string") {
+    return part.value;
+  }
+  return "";
+}
+
+function extractTextFromContentValue(value) {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (Array.isArray(value)) {
+    const textValue = value.map((part) => extractTextFromContentPart(part)).join("").trim();
+    if (textValue) {
+      return textValue;
+    }
+  }
+  if (value && typeof value === "object") {
+    const textValue = extractTextFromContentPart(value).trim();
+    if (textValue) {
+      return textValue;
+    }
+  }
+  return "";
+}
+
+function extractTextFromOutputItems(items) {
+  for (const item of Array.isArray(items) ? items : []) {
+    const textValue = extractTextFromContentValue(item?.content);
+    if (textValue) {
+      return textValue;
+    }
+  }
+  return "";
+}
+
+function extractChatTextFromObject(payload) {
   if (!payload || typeof payload !== "object") {
     return "";
   }
   if (typeof payload.output_text === "string" && payload.output_text.trim()) {
     return payload.output_text.trim();
   }
-  const choiceContent = payload?.choices?.[0]?.message?.content;
-  if (typeof choiceContent === "string" && choiceContent.trim()) {
-    return choiceContent.trim();
+  if (typeof payload?.response?.output_text === "string" && payload.response.output_text.trim()) {
+    return payload.response.output_text.trim();
   }
-  if (Array.isArray(choiceContent)) {
-    const textValue = choiceContent
-      .map((part) => (typeof part?.text === "string" ? part.text : ""))
-      .join("")
-      .trim();
-    if (textValue) {
-      return textValue;
-    }
+  const choiceMessageText = extractTextFromContentValue(payload?.choices?.[0]?.message?.content);
+  if (choiceMessageText) {
+    return choiceMessageText;
   }
-  if (Array.isArray(payload.output)) {
-    for (const item of payload.output) {
-      const content = Array.isArray(item?.content) ? item.content : [];
-      const textValue = content
-        .map((part) => (typeof part?.text === "string" ? part.text : ""))
-        .join("")
-        .trim();
-      if (textValue) {
-        return textValue;
-      }
-    }
+  const choiceDeltaText = extractTextFromContentValue(payload?.choices?.[0]?.delta?.content);
+  if (choiceDeltaText) {
+    return choiceDeltaText;
+  }
+  if (typeof payload?.delta === "string" && payload.delta.trim()) {
+    return payload.delta.trim();
+  }
+  const outputText = extractTextFromOutputItems(payload.output);
+  if (outputText) {
+    return outputText;
+  }
+  const responseOutputText = extractTextFromOutputItems(payload?.response?.output);
+  if (responseOutputText) {
+    return responseOutputText;
+  }
+  const messageText = extractTextFromContentValue(payload?.message?.content);
+  if (messageText) {
+    return messageText;
   }
   return "";
 }
 
+function extractChatTextFromPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+  const directText = extractChatTextFromObject(payload);
+  if (directText) {
+    return directText;
+  }
+
+  const events = Array.isArray(payload.__sseEvents) ? payload.__sseEvents : [];
+  if (events.length > 0) {
+    let deltaText = "";
+    let fullText = "";
+    for (const event of events) {
+      const eventType = String(event?.type || "").toLowerCase();
+      if (eventType.includes("delta")) {
+        const deltaPart = extractTextFromContentValue(
+          event?.delta || event?.choices?.[0]?.delta?.content
+        );
+        if (deltaPart) {
+          deltaText += deltaPart;
+        }
+      }
+      const eventText = extractChatTextFromObject(event);
+      if (eventText) {
+        fullText = eventText;
+      }
+    }
+    const mergedText = (deltaText || fullText).trim();
+    if (mergedText) {
+      return mergedText;
+    }
+  }
+
+  if (typeof payload.__rawText === "string" && payload.__rawText.trim()) {
+    return payload.__rawText.trim();
+  }
+  return "";
+}
+
+function describeOpenClawPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+  const details = [];
+  if (typeof payload.id === "string" && payload.id) {
+    details.push(`id=${payload.id}`);
+  }
+  if (typeof payload.status === "string" && payload.status) {
+    details.push(`status=${payload.status}`);
+  }
+  if (typeof payload.type === "string" && payload.type) {
+    details.push(`type=${payload.type}`);
+  }
+  if (Array.isArray(payload.choices)) {
+    details.push(`choices=${payload.choices.length}`);
+  }
+  if (Array.isArray(payload.output)) {
+    details.push(`output=${payload.output.length}`);
+  }
+  if (Array.isArray(payload.__sseEvents)) {
+    details.push(`sseEvents=${payload.__sseEvents.length}`);
+  }
+  if (typeof payload.__rawText === "string" && payload.__rawText.trim()) {
+    const compact = payload.__rawText.replace(/\s+/g, " ").trim();
+    details.push(`raw=${truncateText(compact, 160)}`);
+  }
+  if (details.length === 0) {
+    const keys = Object.keys(payload).slice(0, 8);
+    if (keys.length > 0) {
+      details.push(`keys=${keys.join(",")}`);
+    }
+  }
+  return details.join(", ");
+}
+
+async function resolveOpenClawModel(targetUrl, preferredId) {
+  const preferred = String(preferredId || "").trim();
+  if (preferred) {
+    return preferred;
+  }
+  const current = String(serializeAgents()[0]?.id || "").trim();
+  if (current) {
+    return current;
+  }
+  try {
+    await refreshOpenClawAgentsViaHttp(targetUrl);
+  } catch (_error) {
+    // Ignore refresh failure here; caller will return user-facing error.
+  }
+  return String(serializeAgents()[0]?.id || "").trim();
+}
+
 async function sendChatViaHttp(targetUrl, payload) {
-  const model = String(payload.agentId || serializeAgents()[0]?.id || "openclaw/default");
+  const requestedAgentId = String(payload.agentId || "").trim();
+  const model = await resolveOpenClawModel(targetUrl, requestedAgentId);
   const userText = String(payload.text || "").trim();
   if (!userText) {
     throw new Error("Pesan kosong.");
+  }
+  if (!model) {
+    throw new Error("Agent OpenClaw belum ketemu. Coba refresh daftar agent dulu.");
+  }
+  const requestHeaders = {};
+  const targetAgentId = requestedAgentId || model;
+  if (targetAgentId) {
+    requestHeaders["x-openclaw-agent-id"] = targetAgentId;
   }
   let completionError = null;
   try {
     const completion = await openClawFetchJson(targetUrl, "/v1/chat/completions", {
       method: "POST",
+      headers: requestHeaders,
       body: {
         model,
         messages: [
@@ -720,11 +943,15 @@ async function sendChatViaHttp(targetUrl, payload) {
         ],
         stream: false
       },
-      timeoutMs: OPENCLAW_HTTP_CHAT_TIMEOUT_MS
+      timeoutMs: OPENCLAW_HTTP_CHAT_TIMEOUT_MS,
+      allowNonJson: true
     });
     const text = extractChatTextFromPayload(completion);
     if (!text) {
-      throw new Error("OpenClaw response kosong.");
+      const info = describeOpenClawPayload(completion);
+      throw new Error(
+        info ? `OpenClaw response kosong (${info}).` : "OpenClaw response kosong."
+      );
     }
     return {
       model,
@@ -737,15 +964,20 @@ async function sendChatViaHttp(targetUrl, payload) {
   try {
     const fallback = await openClawFetchJson(targetUrl, "/v1/responses", {
       method: "POST",
+      headers: requestHeaders,
       body: {
         model,
         input: userText
       },
-      timeoutMs: OPENCLAW_HTTP_CHAT_TIMEOUT_MS
+      timeoutMs: OPENCLAW_HTTP_CHAT_TIMEOUT_MS,
+      allowNonJson: true
     });
     const text = extractChatTextFromPayload(fallback);
     if (!text) {
-      throw new Error("OpenClaw response kosong.");
+      const info = describeOpenClawPayload(fallback);
+      throw new Error(
+        info ? `OpenClaw response kosong (${info}).` : "OpenClaw response kosong."
+      );
     }
     return {
       model,
