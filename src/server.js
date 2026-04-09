@@ -12,6 +12,10 @@ const PORT = Number(process.env.PORT || 8080);
 const HUB_ID = process.env.HUB_ID || "hub-trial";
 const OPENCLAW_AUTH_TOKEN_ENV = String(process.env.OPENCLAW_AUTH_TOKEN || "").trim();
 const OPENCLAW_RECONNECT_MS = Number(process.env.OPENCLAW_RECONNECT_MS || 2000);
+const OPENCLAW_WS_HEARTBEAT_MS = Math.max(
+  0,
+  Number(process.env.OPENCLAW_WS_HEARTBEAT_MS || 4000)
+);
 const OPENCLAW_DISCOVERY_TIMEOUT_MS = Number(
   process.env.OPENCLAW_DISCOVERY_TIMEOUT_MS || 1600
 );
@@ -147,6 +151,7 @@ const state = {
   openclawTargetUrl: null,
   openclawAttempt: 0,
   openclawManualClose: false,
+  openclawHeartbeat: null,
   openclawCandidatesCache: [],
   proxyLastAction: settings.proxy.lastAction || null,
   dockerLastAction: settings.docker.lastAction || null
@@ -439,6 +444,37 @@ function sendSystemMessage(text) {
   });
 }
 
+function clearOpenClawHeartbeat() {
+  if (!state.openclawHeartbeat) {
+    return;
+  }
+  clearInterval(state.openclawHeartbeat);
+  state.openclawHeartbeat = null;
+}
+
+function startOpenClawHeartbeat(socket, targetUrl) {
+  clearOpenClawHeartbeat();
+  if (!socket || OPENCLAW_WS_HEARTBEAT_MS <= 0) {
+    return;
+  }
+
+  state.openclawHeartbeat = setInterval(() => {
+    if (!state.openclawSocket || state.openclawSocket !== socket) {
+      clearOpenClawHeartbeat();
+      return;
+    }
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    try {
+      socket.ping();
+    } catch (error) {
+      state.openclawLastError = String(error?.message || "OpenClaw heartbeat error");
+      log("OpenClaw heartbeat failed:", `${targetUrl} ${state.openclawLastError}`);
+    }
+  }, OPENCLAW_WS_HEARTBEAT_MS);
+}
+
 function upsertAgent(agent) {
   if (!agent || typeof agent !== "object") {
     return;
@@ -590,6 +626,7 @@ function connectToOpenClaw() {
     state.openclawConnected = true;
     state.openclawLastError = "";
     state.openclawAttempt = 0;
+    startOpenClawHeartbeat(ws, targetUrl);
     log("Connected to OpenClaw:", targetUrl);
     sendSystemMessage(`Hub connected to OpenClaw (${targetUrl})`);
     broadcastConfig();
@@ -615,6 +652,7 @@ function connectToOpenClaw() {
   ws.on("close", (code, reason) => {
     state.openclawConnected = false;
     state.openclawSocket = null;
+    clearOpenClawHeartbeat();
     const reasonText = reason ? reason.toString() : "";
     const errorDetail = state.openclawLastError || reasonText;
 
@@ -647,6 +685,7 @@ function connectToOpenClaw() {
 function reconnectToOpenClaw(reason) {
   log("Reconnecting OpenClaw:", reason);
   clearTimeout(state.reconnectTimer);
+  clearOpenClawHeartbeat();
   if (state.openclawSocket) {
     state.openclawManualClose = true;
     try {
@@ -963,6 +1002,43 @@ function truncateText(value, maxLength = 1000) {
   return `${text.slice(0, maxLength)}...<truncated>`;
 }
 
+function redactCommandArgs(args) {
+  const sensitiveFlags = new Set([
+    "--token",
+    "--password",
+    "--secret",
+    "--api-key",
+    "--auth-token",
+    "--authorization"
+  ]);
+  const masked = [];
+  let maskNext = false;
+  for (const arg of Array.isArray(args) ? args : []) {
+    const value = String(arg || "");
+    if (maskNext) {
+      masked.push("***");
+      maskNext = false;
+      continue;
+    }
+    const lower = value.toLowerCase();
+    if (sensitiveFlags.has(lower)) {
+      masked.push(value);
+      maskNext = true;
+      continue;
+    }
+    const separatorIndex = value.indexOf("=");
+    if (separatorIndex > 0) {
+      const key = value.slice(0, separatorIndex).toLowerCase();
+      if (sensitiveFlags.has(key)) {
+        masked.push(`${value.slice(0, separatorIndex)}=***`);
+        continue;
+      }
+    }
+    masked.push(value);
+  }
+  return masked;
+}
+
 function runProcess(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
@@ -1013,7 +1089,7 @@ function runProcess(command, args, options = {}) {
         elapsedMs
       };
       if (code !== 0) {
-        const argText = Array.isArray(args) ? args.join(" ") : "";
+        const argText = Array.isArray(args) ? redactCommandArgs(args).join(" ") : "";
         const stderrText = truncateText(result.stderr || "(empty)");
         const stdoutText = truncateText(result.stdout || "(empty)");
         done(
@@ -1377,45 +1453,46 @@ async function runOpenClawDockerPairing(options = {}) {
     const networkConnect = await tryConnectHubToNetwork(selectedNetwork);
     const wsUrl = buildOpenClawDockerWsUrl(targetContainer.names);
 
-    const probeContainerName = `hub-openclaw-probe-${Date.now()}`;
-    const probeArgs = [
-      "run",
-      "--rm",
-      "--name",
-      probeContainerName,
-      "--network",
-      selectedNetwork
-    ];
+    const runGatewayProbe = async () => {
+      const probeContainerName = `hub-openclaw-probe-${Date.now()}`;
+      const probeArgs = [
+        "run",
+        "--rm",
+        "--name",
+        probeContainerName,
+        "--network",
+        selectedNetwork
+      ];
 
-    if (OPENCLAW_DOCKER_ALLOW_INSECURE_PRIVATE_WS) {
-      probeArgs.push("-e", "OPENCLAW_ALLOW_INSECURE_PRIVATE_WS=1");
-    }
-    if (OPENCLAW_DOCKER_STATE_VOLUME) {
-      probeArgs.push("-v", `${OPENCLAW_DOCKER_STATE_VOLUME}:/data/.openclaw`);
-    }
+      if (OPENCLAW_DOCKER_ALLOW_INSECURE_PRIVATE_WS) {
+        probeArgs.push("-e", "OPENCLAW_ALLOW_INSECURE_PRIVATE_WS=1");
+      }
+      if (OPENCLAW_DOCKER_STATE_VOLUME) {
+        probeArgs.push("-v", `${OPENCLAW_DOCKER_STATE_VOLUME}:/data/.openclaw`);
+      }
 
-    probeArgs.push(
-      "--entrypoint",
-      "openclaw",
-      OPENCLAW_DOCKER_PROBE_IMAGE,
-      "gateway",
-      "probe",
-      "--url",
-      wsUrl,
-      "--token",
-      token,
-      "--timeout",
-      String(OPENCLAW_DOCKER_PROBE_TIMEOUT_MS),
-      "--json"
-    );
+      probeArgs.push(
+        "--entrypoint",
+        "openclaw",
+        OPENCLAW_DOCKER_PROBE_IMAGE,
+        "gateway",
+        "probe",
+        "--url",
+        wsUrl,
+        "--token",
+        token,
+        "--timeout",
+        String(OPENCLAW_DOCKER_PROBE_TIMEOUT_MS),
+        "--json"
+      );
 
-    const probeResult = await runDockerCommand(probeArgs, {
-      timeoutMs: Math.max(OPENCLAW_DOCKER_PROBE_TIMEOUT_MS + 4000, DOCKER_COMMAND_TIMEOUT_MS)
-    });
+      return runDockerCommand(probeArgs, {
+        timeoutMs: Math.max(OPENCLAW_DOCKER_PROBE_TIMEOUT_MS + 4000, DOCKER_COMMAND_TIMEOUT_MS)
+      });
+    };
 
-    let approveResult = null;
-    if (OPENCLAW_DOCKER_AUTO_APPROVE) {
-      approveResult = await runDockerCommand(
+    const runDevicesApproveLatest = async () => {
+      return runDockerCommand(
         [
           "exec",
           targetContainer.names,
@@ -1427,6 +1504,32 @@ async function runOpenClawDockerPairing(options = {}) {
         ],
         { timeoutMs: DOCKER_COMMAND_TIMEOUT_MS }
       );
+    };
+
+    let probeResult = null;
+    let firstProbeError = null;
+    try {
+      probeResult = await runGatewayProbe();
+    } catch (error) {
+      firstProbeError = error;
+    }
+
+    let approveResult = null;
+    if (OPENCLAW_DOCKER_AUTO_APPROVE) {
+      approveResult = await runDevicesApproveLatest();
+    }
+
+    if (!probeResult) {
+      if (!OPENCLAW_DOCKER_AUTO_APPROVE) {
+        throw firstProbeError || new Error("Gateway probe gagal.");
+      }
+      try {
+        probeResult = await runGatewayProbe();
+      } catch (secondProbeError) {
+        const firstMsg = firstProbeError ? `Probe awal gagal: ${firstProbeError.message}` : "";
+        const secondMsg = `Probe ulang setelah approve gagal: ${secondProbeError.message}`;
+        throw new Error([firstMsg, secondMsg].filter(Boolean).join(" | "));
+      }
     }
 
     settings.openclaw.url = wsUrl;
@@ -1806,6 +1909,7 @@ server.listen(PORT, "0.0.0.0", () => {
 
 function shutdown() {
   clearTimeout(state.reconnectTimer);
+  clearOpenClawHeartbeat();
   if (state.openclawSocket) {
     try {
       state.openclawSocket.close();
