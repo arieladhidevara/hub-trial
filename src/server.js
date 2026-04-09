@@ -16,6 +16,17 @@ const OPENCLAW_WS_HEARTBEAT_MS = Math.max(
   0,
   Number(process.env.OPENCLAW_WS_HEARTBEAT_MS || 0)
 );
+const OPENCLAW_TRANSPORT = String(process.env.OPENCLAW_TRANSPORT || "http-api")
+  .trim()
+  .toLowerCase();
+const OPENCLAW_HTTP_TIMEOUT_MS = Math.max(
+  1000,
+  Number(process.env.OPENCLAW_HTTP_TIMEOUT_MS || 10000)
+);
+const OPENCLAW_HTTP_POLL_MS = Math.max(
+  0,
+  Number(process.env.OPENCLAW_HTTP_POLL_MS || 12000)
+);
 const OPENCLAW_DISCOVERY_TIMEOUT_MS = Number(
   process.env.OPENCLAW_DISCOVERY_TIMEOUT_MS || 1600
 );
@@ -153,6 +164,9 @@ const state = {
   openclawAttempt: 0,
   openclawManualCloseSocket: null,
   openclawHeartbeat: null,
+  openclawHttpPollTimer: null,
+  openclawHttpConnectInFlight: false,
+  openclawHttpPollInFlight: false,
   openclawCandidatesCache: [],
   proxyLastAction: settings.proxy.lastAction || null,
   dockerLastAction: settings.docker.lastAction || null
@@ -397,6 +411,7 @@ function getPublicConfig(requestHeaders = {}) {
   const candidates = buildOpenClawCandidates();
   return {
     openclaw: {
+      transport: OPENCLAW_TRANSPORT,
       configuredUrl: settings.openclaw.url || "",
       activeUrl: state.openclawTargetUrl,
       connected: state.openclawConnected,
@@ -455,6 +470,283 @@ function sendSystemMessage(text) {
       timestamp: toIsoNow()
     }
   });
+}
+
+function clearOpenClawHttpPoll() {
+  if (!state.openclawHttpPollTimer) {
+    return;
+  }
+  clearInterval(state.openclawHttpPollTimer);
+  state.openclawHttpPollTimer = null;
+}
+
+function wsUrlToHttpBaseUrl(wsUrl) {
+  const parsed = new URL(sanitizeOpenClawUrl(wsUrl));
+  const protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+  return `${protocol}//${parsed.host}`;
+}
+
+async function openClawFetchJson(targetWsUrl, apiPath, options = {}) {
+  const token = getCurrentOpenClawToken();
+  if (!token) {
+    throw new Error("OpenClaw token belum ada.");
+  }
+
+  const baseUrl = wsUrlToHttpBaseUrl(targetWsUrl);
+  const pathValue = String(apiPath || "").trim();
+  const normalizedPath = pathValue.startsWith("/") ? pathValue : `/${pathValue}`;
+  const url = `${baseUrl}${normalizedPath}`;
+  const method = String(options.method || "GET").toUpperCase();
+  const timeoutMs = Number(options.timeoutMs || OPENCLAW_HTTP_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal
+    });
+    const raw = await response.text();
+    let parsed = null;
+    try {
+      parsed = raw ? JSON.parse(raw) : null;
+    } catch (_error) {
+      parsed = null;
+    }
+    if (!response.ok) {
+      const detail =
+        parsed?.error?.message ||
+        parsed?.message ||
+        parsed?.detail ||
+        (raw ? truncateText(raw, 300) : "") ||
+        `${response.status} ${response.statusText}`;
+      const error = new Error(`OpenClaw API ${normalizedPath} gagal: ${detail}`);
+      error.statusCode = response.status;
+      throw error;
+    }
+    return parsed || {};
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error(`OpenClaw API ${normalizedPath} timeout setelah ${timeoutMs}ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function extractModelsFromPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+  if (Array.isArray(payload.data)) {
+    return payload.data;
+  }
+  if (Array.isArray(payload.models)) {
+    return payload.models;
+  }
+  if (Array.isArray(payload.result?.models)) {
+    return payload.result.models;
+  }
+  return [];
+}
+
+function publishAgentList() {
+  broadcast({
+    type: "agent_list",
+    payload: {
+      agents: serializeAgents()
+    }
+  });
+}
+
+async function refreshOpenClawAgentsViaHttp(targetUrl) {
+  const payload = await openClawFetchJson(targetUrl, "/v1/models", {
+    method: "GET",
+    timeoutMs: OPENCLAW_HTTP_TIMEOUT_MS
+  });
+  const models = extractModelsFromPayload(payload);
+  if (models.length === 0) {
+    return [];
+  }
+
+  state.agents.clear();
+  for (const model of models) {
+    const id = String(model?.id || model?.name || "").trim();
+    if (!id) {
+      continue;
+    }
+    upsertAgent({
+      id,
+      name: String(model?.name || id),
+      status: "online",
+      description: String(model?.description || "")
+    });
+  }
+  publishAgentList();
+  return models;
+}
+
+function startOpenClawHttpPoll(targetUrl) {
+  clearOpenClawHttpPoll();
+  if (OPENCLAW_HTTP_POLL_MS <= 0) {
+    return;
+  }
+  state.openclawHttpPollTimer = setInterval(async () => {
+    if (state.openclawHttpPollInFlight) {
+      return;
+    }
+    if (!state.openclawConnected || state.openclawTargetUrl !== targetUrl) {
+      return;
+    }
+    state.openclawHttpPollInFlight = true;
+    try {
+      await refreshOpenClawAgentsViaHttp(targetUrl);
+    } catch (error) {
+      const message = String(error?.message || "unknown OpenClaw HTTP error");
+      state.openclawConnected = false;
+      state.openclawConnectedAt = 0;
+      state.openclawLastError = message;
+      clearOpenClawHttpPoll();
+      broadcastConfig();
+      log("OpenClaw HTTP poll failed:", `${targetUrl} ${message}`);
+      sendSystemMessage(`OpenClaw disconnected: ${message}`);
+      scheduleReconnect();
+    } finally {
+      state.openclawHttpPollInFlight = false;
+    }
+  }, OPENCLAW_HTTP_POLL_MS);
+}
+
+async function connectToOpenClawViaHttp(targetUrl) {
+  if (state.openclawHttpConnectInFlight) {
+    return;
+  }
+  state.openclawHttpConnectInFlight = true;
+  const previouslyConnected = state.openclawConnected && state.openclawTargetUrl === targetUrl;
+  try {
+    await refreshOpenClawAgentsViaHttp(targetUrl);
+    state.openclawConnected = true;
+    state.openclawConnectedAt = Date.now();
+    state.openclawLastError = "";
+    state.openclawAttempt = 0;
+    if (!previouslyConnected) {
+      log("Connected to OpenClaw over HTTP API:", targetUrl);
+      sendSystemMessage(`Hub connected to OpenClaw (${targetUrl})`);
+    }
+    broadcastConfig();
+    startOpenClawHttpPoll(targetUrl);
+  } catch (error) {
+    const message = String(error?.message || "unknown OpenClaw HTTP error");
+    const wasConnected = state.openclawConnected;
+    state.openclawConnected = false;
+    state.openclawConnectedAt = 0;
+    state.openclawLastError = message;
+    clearOpenClawHttpPoll();
+    broadcastConfig();
+    log("OpenClaw HTTP connect failed:", `${targetUrl} ${message}`);
+    if (wasConnected) {
+      sendSystemMessage(`OpenClaw disconnected: ${message}`);
+    }
+    scheduleReconnect();
+  } finally {
+    state.openclawHttpConnectInFlight = false;
+  }
+}
+
+function extractChatTextFromPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+  if (typeof payload.output_text === "string" && payload.output_text.trim()) {
+    return payload.output_text.trim();
+  }
+  const choiceContent = payload?.choices?.[0]?.message?.content;
+  if (typeof choiceContent === "string" && choiceContent.trim()) {
+    return choiceContent.trim();
+  }
+  if (Array.isArray(choiceContent)) {
+    const textValue = choiceContent
+      .map((part) => (typeof part?.text === "string" ? part.text : ""))
+      .join("")
+      .trim();
+    if (textValue) {
+      return textValue;
+    }
+  }
+  if (Array.isArray(payload.output)) {
+    for (const item of payload.output) {
+      const content = Array.isArray(item?.content) ? item.content : [];
+      const textValue = content
+        .map((part) => (typeof part?.text === "string" ? part.text : ""))
+        .join("")
+        .trim();
+      if (textValue) {
+        return textValue;
+      }
+    }
+  }
+  return "";
+}
+
+async function sendChatViaHttp(targetUrl, payload) {
+  const model = String(payload.agentId || serializeAgents()[0]?.id || "openclaw/default");
+  const userText = String(payload.text || "").trim();
+  if (!userText) {
+    throw new Error("Pesan kosong.");
+  }
+
+  try {
+    const completion = await openClawFetchJson(targetUrl, "/v1/chat/completions", {
+      method: "POST",
+      body: {
+        model,
+        messages: [
+          {
+            role: "user",
+            content: userText
+          }
+        ],
+        stream: false
+      },
+      timeoutMs: Math.max(OPENCLAW_HTTP_TIMEOUT_MS, 15000)
+    });
+    const text = extractChatTextFromPayload(completion);
+    if (!text) {
+      throw new Error("OpenClaw response kosong.");
+    }
+    return {
+      model,
+      text
+    };
+  } catch (error) {
+    if (Number(error?.statusCode || 0) !== 404) {
+      throw error;
+    }
+    const fallback = await openClawFetchJson(targetUrl, "/v1/responses", {
+      method: "POST",
+      body: {
+        model,
+        input: userText
+      },
+      timeoutMs: Math.max(OPENCLAW_HTTP_TIMEOUT_MS, 15000)
+    });
+    const text = extractChatTextFromPayload(fallback);
+    if (!text) {
+      throw new Error("OpenClaw response kosong.");
+    }
+    return {
+      model,
+      text
+    };
+  }
 }
 
 function clearOpenClawHeartbeat() {
@@ -635,6 +927,11 @@ function connectToOpenClaw() {
   }
   state.openclawTargetUrl = targetUrl;
 
+  if (OPENCLAW_TRANSPORT !== "legacy-ws") {
+    void connectToOpenClawViaHttp(targetUrl);
+    return;
+  }
+
   const headers = {};
   const token = getCurrentOpenClawToken();
   if (token) {
@@ -730,6 +1027,16 @@ function reconnectToOpenClaw(reason) {
   log("Reconnecting OpenClaw:", reason);
   clearTimeout(state.reconnectTimer);
   clearOpenClawHeartbeat();
+  clearOpenClawHttpPoll();
+
+  if (OPENCLAW_TRANSPORT !== "legacy-ws") {
+    state.openclawConnected = false;
+    state.openclawConnectedAt = 0;
+    state.openclawSocket = null;
+    connectToOpenClaw();
+    return;
+  }
+
   if (state.openclawSocket) {
     const closingSocket = state.openclawSocket;
     state.openclawManualCloseSocket = closingSocket;
@@ -832,6 +1139,30 @@ async function probeOpenClawUrl(url, token) {
   });
 }
 
+async function probeOpenClawHttpUrl(url) {
+  const start = Date.now();
+  try {
+    const payload = await openClawFetchJson(url, "/v1/models", {
+      method: "GET",
+      timeoutMs: Math.max(OPENCLAW_HTTP_TIMEOUT_MS, OPENCLAW_DISCOVERY_TIMEOUT_MS + 800)
+    });
+    const models = extractModelsFromPayload(payload);
+    return {
+      url,
+      reachable: true,
+      latencyMs: Date.now() - start,
+      reason: models.length > 0 ? `reachable (models=${models.length})` : "reachable"
+    };
+  } catch (error) {
+    return {
+      url,
+      reachable: false,
+      latencyMs: Date.now() - start,
+      reason: String(error?.message || "http probe failed")
+    };
+  }
+}
+
 async function runOpenClawDiscovery(options = {}) {
   const autoApply = options.autoApply !== false;
   const trigger = options.trigger || "manual";
@@ -851,7 +1182,10 @@ async function runOpenClawDiscovery(options = {}) {
     return result;
   }
 
-  const probes = await Promise.all(candidates.map((url) => probeOpenClawUrl(url, token)));
+  const probes =
+    OPENCLAW_TRANSPORT === "legacy-ws"
+      ? await Promise.all(candidates.map((url) => probeOpenClawUrl(url, token)))
+      : await Promise.all(candidates.map((url) => probeOpenClawHttpUrl(url)));
   probes.sort((a, b) => {
     if (a.reachable !== b.reachable) {
       return a.reachable ? -1 : 1;
@@ -1712,7 +2046,7 @@ async function runOpenClawDockerPairing(options = {}) {
   }
 }
 
-function forwardChatToOpenClaw(localMessage, clientId) {
+async function forwardChatToOpenClaw(localMessage, clientId) {
   const text = String(localMessage.text || "").trim();
   if (!text) {
     return { ok: false, reason: "Pesan kosong." };
@@ -1726,6 +2060,54 @@ function forwardChatToOpenClaw(localMessage, clientId) {
     timestamp: toIsoNow()
   };
 
+  broadcast({
+    type: "chat",
+    payload: {
+      agentId: payload.agentId || "local",
+      agentName: payload.agentId || "You",
+      text: payload.text,
+      source: "local",
+      timestamp: payload.timestamp
+    }
+  });
+
+  if (OPENCLAW_TRANSPORT !== "legacy-ws") {
+    if (!state.openclawConnected || !state.openclawTargetUrl) {
+      return { ok: false, reason: "OpenClaw belum terkoneksi." };
+    }
+    try {
+      const response = await sendChatViaHttp(state.openclawTargetUrl, payload);
+      const responseTimestamp = toIsoNow();
+      const responseAgentId = String(response.model || payload.agentId || "openclaw");
+      upsertAgent({
+        id: responseAgentId,
+        name: responseAgentId,
+        status: "online",
+        lastSeen: responseTimestamp
+      });
+      publishAgentList();
+      broadcast({
+        type: "chat",
+        payload: {
+          agentId: responseAgentId,
+          agentName: responseAgentId,
+          text: response.text,
+          source: "openclaw",
+          timestamp: responseTimestamp
+        }
+      });
+      return { ok: true };
+    } catch (error) {
+      state.openclawLastError = String(error?.message || "OpenClaw HTTP chat error");
+      state.openclawConnected = false;
+      state.openclawConnectedAt = 0;
+      clearOpenClawHttpPoll();
+      broadcastConfig();
+      scheduleReconnect();
+      return { ok: false, reason: state.openclawLastError };
+    }
+  }
+
   if (!state.openclawConnected || !state.openclawSocket) {
     return { ok: false, reason: "OpenClaw belum terkoneksi." };
   }
@@ -1737,17 +2119,6 @@ function forwardChatToOpenClaw(localMessage, clientId) {
   if (!sent) {
     return { ok: false, reason: "Gagal kirim chat ke OpenClaw." };
   }
-
-  broadcast({
-    type: "chat",
-    payload: {
-      agentId: payload.agentId || "local",
-      agentName: payload.agentId || "You",
-      text: payload.text,
-      source: "local",
-      timestamp: payload.timestamp
-    }
-  });
 
   return { ok: true };
 }
@@ -1935,7 +2306,7 @@ localWss.on("connection", (socket, request) => {
     }
   });
 
-  socket.on("message", (raw) => {
+  socket.on("message", async (raw) => {
     const message = safeParse(raw);
     if (!message) {
       sendJson(socket, {
@@ -1948,6 +2319,22 @@ localWss.on("connection", (socket, request) => {
     }
 
     if (message.type === "request_agents") {
+      if (OPENCLAW_TRANSPORT !== "legacy-ws" && state.openclawTargetUrl) {
+        try {
+          await refreshOpenClawAgentsViaHttp(state.openclawTargetUrl);
+          state.openclawConnected = true;
+          state.openclawConnectedAt = Date.now();
+          state.openclawLastError = "";
+          broadcastConfig();
+        } catch (error) {
+          state.openclawLastError = String(error?.message || "OpenClaw HTTP agent refresh error");
+          state.openclawConnected = false;
+          state.openclawConnectedAt = 0;
+          clearOpenClawHttpPoll();
+          broadcastConfig();
+          scheduleReconnect();
+        }
+      }
       sendJson(socket, {
         type: "agent_list",
         payload: {
@@ -1973,7 +2360,7 @@ localWss.on("connection", (socket, request) => {
     }
 
     if (message.type === "chat") {
-      const result = forwardChatToOpenClaw(message, clientId);
+      const result = await forwardChatToOpenClaw(message, clientId);
       if (!result.ok) {
         sendJson(socket, {
           type: "error",
@@ -2047,6 +2434,7 @@ server.listen(PORT, "0.0.0.0", () => {
 function shutdown() {
   clearTimeout(state.reconnectTimer);
   clearOpenClawHeartbeat();
+  clearOpenClawHttpPoll();
   if (state.openclawSocket) {
     try {
       state.openclawSocket.close();

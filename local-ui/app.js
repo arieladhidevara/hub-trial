@@ -380,7 +380,7 @@ async function autoDiscoverDockerUrl() {
       method: "POST",
       body: {
         force: false,
-        reconnect: true
+        reconnect: false
       }
     });
     renderConfig(response.config || {});
