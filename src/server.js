@@ -23,6 +23,10 @@ const OPENCLAW_HTTP_TIMEOUT_MS = Math.max(
   1000,
   Number(process.env.OPENCLAW_HTTP_TIMEOUT_MS || 10000)
 );
+const OPENCLAW_HTTP_CHAT_TIMEOUT_MS = Math.max(
+  OPENCLAW_HTTP_TIMEOUT_MS,
+  Number(process.env.OPENCLAW_HTTP_CHAT_TIMEOUT_MS || 60000)
+);
 const OPENCLAW_HTTP_POLL_MS = Math.max(
   0,
   Number(process.env.OPENCLAW_HTTP_POLL_MS || 12000)
@@ -702,7 +706,7 @@ async function sendChatViaHttp(targetUrl, payload) {
   if (!userText) {
     throw new Error("Pesan kosong.");
   }
-
+  let completionError = null;
   try {
     const completion = await openClawFetchJson(targetUrl, "/v1/chat/completions", {
       method: "POST",
@@ -716,7 +720,7 @@ async function sendChatViaHttp(targetUrl, payload) {
         ],
         stream: false
       },
-      timeoutMs: Math.max(OPENCLAW_HTTP_TIMEOUT_MS, 15000)
+      timeoutMs: OPENCLAW_HTTP_CHAT_TIMEOUT_MS
     });
     const text = extractChatTextFromPayload(completion);
     if (!text) {
@@ -727,16 +731,17 @@ async function sendChatViaHttp(targetUrl, payload) {
       text
     };
   } catch (error) {
-    if (Number(error?.statusCode || 0) !== 404) {
-      throw error;
-    }
+    completionError = error;
+  }
+
+  try {
     const fallback = await openClawFetchJson(targetUrl, "/v1/responses", {
       method: "POST",
       body: {
         model,
         input: userText
       },
-      timeoutMs: Math.max(OPENCLAW_HTTP_TIMEOUT_MS, 15000)
+      timeoutMs: OPENCLAW_HTTP_CHAT_TIMEOUT_MS
     });
     const text = extractChatTextFromPayload(fallback);
     if (!text) {
@@ -746,6 +751,12 @@ async function sendChatViaHttp(targetUrl, payload) {
       model,
       text
     };
+  } catch (fallbackError) {
+    const firstMessage = completionError
+      ? `chat.completions: ${String(completionError?.message || "failed")}`
+      : "";
+    const secondMessage = `responses: ${String(fallbackError?.message || "failed")}`;
+    throw new Error([firstMessage, secondMessage].filter(Boolean).join(" | "));
   }
 }
 
@@ -2099,11 +2110,13 @@ async function forwardChatToOpenClaw(localMessage, clientId) {
       return { ok: true };
     } catch (error) {
       state.openclawLastError = String(error?.message || "OpenClaw HTTP chat error");
-      state.openclawConnected = false;
-      state.openclawConnectedAt = 0;
-      clearOpenClawHttpPoll();
       broadcastConfig();
-      scheduleReconnect();
+      if (!state.openclawLastError.toLowerCase().includes("timeout")) {
+        state.openclawConnected = false;
+        state.openclawConnectedAt = 0;
+        clearOpenClawHttpPoll();
+        scheduleReconnect();
+      }
       return { ok: false, reason: state.openclawLastError };
     }
   }
