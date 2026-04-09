@@ -150,7 +150,7 @@ const state = {
   reconnectTimer: null,
   openclawTargetUrl: null,
   openclawAttempt: 0,
-  openclawManualClose: false,
+  openclawManualCloseSocket: null,
   openclawHeartbeat: null,
   openclawCandidatesCache: [],
   proxyLastAction: settings.proxy.lastAction || null,
@@ -623,6 +623,14 @@ function connectToOpenClaw() {
   state.openclawSocket = ws;
 
   ws.on("open", () => {
+    if (state.openclawSocket !== ws) {
+      try {
+        ws.close(1000, "stale-socket");
+      } catch (_error) {
+        // no-op
+      }
+      return;
+    }
     state.openclawConnected = true;
     state.openclawLastError = "";
     state.openclawAttempt = 0;
@@ -646,22 +654,38 @@ function connectToOpenClaw() {
   });
 
   ws.on("message", (raw) => {
+    if (state.openclawSocket !== ws) {
+      return;
+    }
     handleOpenClawMessage(raw);
   });
 
   ws.on("close", (code, reason) => {
-    state.openclawConnected = false;
-    state.openclawSocket = null;
-    clearOpenClawHeartbeat();
     const reasonText = reason ? reason.toString() : "";
-    const errorDetail = state.openclawLastError || reasonText;
+    const isCurrentSocket = state.openclawSocket === ws;
+    const isManualReconfigureClose = state.openclawManualCloseSocket === ws;
 
-    if (state.openclawManualClose) {
-      state.openclawManualClose = false;
+    if (isManualReconfigureClose) {
+      state.openclawManualCloseSocket = null;
+      if (isCurrentSocket) {
+        state.openclawConnected = false;
+        state.openclawSocket = null;
+        clearOpenClawHeartbeat();
+      }
       log("OpenClaw socket closed for reconfigure.");
       connectToOpenClaw();
       return;
     }
+
+    if (!isCurrentSocket) {
+      log("Ignoring stale OpenClaw close:", `${code} ${reasonText} (${targetUrl})`);
+      return;
+    }
+
+    state.openclawConnected = false;
+    state.openclawSocket = null;
+    clearOpenClawHeartbeat();
+    const errorDetail = state.openclawLastError || reasonText;
 
     sendSystemMessage(
       errorDetail
@@ -677,6 +701,9 @@ function connectToOpenClaw() {
   });
 
   ws.on("error", (error) => {
+    if (state.openclawSocket !== ws) {
+      return;
+    }
     state.openclawLastError = String(error?.message || "unknown OpenClaw error");
     log("OpenClaw error:", error.message);
   });
@@ -687,11 +714,15 @@ function reconnectToOpenClaw(reason) {
   clearTimeout(state.reconnectTimer);
   clearOpenClawHeartbeat();
   if (state.openclawSocket) {
-    state.openclawManualClose = true;
+    const closingSocket = state.openclawSocket;
+    state.openclawManualCloseSocket = closingSocket;
     try {
-      state.openclawSocket.close(1000, "reconfigure");
+      closingSocket.close(1000, "reconfigure");
     } catch (_error) {
-      state.openclawSocket = null;
+      state.openclawManualCloseSocket = null;
+      if (state.openclawSocket === closingSocket) {
+        state.openclawSocket = null;
+      }
       connectToOpenClaw();
     }
     return;
