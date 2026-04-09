@@ -46,7 +46,7 @@ const ENV_OPENCLAW_WS_CANDIDATES = String(
   .map((value) => value.trim())
   .filter(Boolean);
 const ENV_OPENCLAW_HOST = String(process.env.OPENCLAW_HOST || "").trim();
-const ENV_OPENCLAW_PORT = Number(process.env.OPENCLAW_PORT || 18789);
+const ENV_OPENCLAW_PORT = Number(process.env.OPENCLAW_PORT || 43136);
 const ENV_OPENCLAW_PATH = normalizePath(
   String(process.env.OPENCLAW_PATH || "").trim()
 );
@@ -100,7 +100,7 @@ const OPENCLAW_DOCKER_WS_URL = String(
   process.env.OPENCLAW_DOCKER_WS_URL || ""
 ).trim();
 const OPENCLAW_DOCKER_GATEWAY_PORT = Number(
-  process.env.OPENCLAW_DOCKER_GATEWAY_PORT || 18789
+  process.env.OPENCLAW_DOCKER_GATEWAY_PORT || 43136
 );
 const OPENCLAW_DOCKER_PROBE_IMAGE = String(
   process.env.OPENCLAW_DOCKER_PROBE_IMAGE || "ghcr.io/hostinger/hvps-openclaw:latest"
