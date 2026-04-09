@@ -69,10 +69,11 @@ In UI:
 1. Paste VPS IP/host
 2. Click `Connect`
 3. Fill OpenClaw token
-4. Click `Save + Connect`
+4. Leave OpenClaw URL empty (auto Docker pair), then click `Save + Connect`
 5. Chat
 
 If URL is empty on save, Hub auto-tries Docker pairing.
+Default fallback candidate now uses `ws://<host>:43136` (empty path), matching Hostinger OpenClaw gateway defaults.
 
 ## SSH Tunnel Mode (recommended)
 Local UI now can run SSH tunnel internally on `Connect`:
@@ -83,7 +84,8 @@ Local UI now can run SSH tunnel internally on `Connect`:
 
 Requirements:
 - `ssh` binary installed on laptop
-- key-based SSH access to VPS (BatchMode). If password-only SSH, auto tunnel will fail.
+- SSH key or SSH password (can be filled in Local UI).
+- If password flow fails on your setup, run manual `ssh` once to accept host key, then retry.
 
 ## How Hub Detects Container / Network
 

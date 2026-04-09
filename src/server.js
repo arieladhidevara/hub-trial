@@ -27,9 +27,9 @@ const ENV_OPENCLAW_WS_CANDIDATES = String(
   .map((value) => value.trim())
   .filter(Boolean);
 const ENV_OPENCLAW_HOST = String(process.env.OPENCLAW_HOST || "").trim();
-const ENV_OPENCLAW_PORT = Number(process.env.OPENCLAW_PORT || 8787);
+const ENV_OPENCLAW_PORT = Number(process.env.OPENCLAW_PORT || 43136);
 const ENV_OPENCLAW_PATH = normalizePath(
-  String(process.env.OPENCLAW_PATH || "/ws/openclaw").trim()
+  String(process.env.OPENCLAW_PATH || "").trim()
 );
 const ENV_OPENCLAW_AUTO_DISCOVER = parseBoolean(
   process.env.OPENCLAW_AUTO_DISCOVER,
@@ -141,6 +141,7 @@ const state = {
   agents: new Map(),
   localClients: new Set(),
   openclawConnected: false,
+  openclawLastError: "",
   openclawSocket: null,
   reconnectTimer: null,
   openclawTargetUrl: null,
@@ -196,10 +197,11 @@ function applyCorsHeaders(req, res) {
 }
 
 function normalizePath(pathValue) {
-  if (!pathValue) {
-    return "/ws/openclaw";
+  const value = String(pathValue || "").trim();
+  if (!value || value === "/") {
+    return "";
   }
-  return pathValue.startsWith("/") ? pathValue : `/${pathValue}`;
+  return value.startsWith("/") ? value : `/${value}`;
 }
 
 function toIsoNow() {
@@ -380,6 +382,7 @@ function getPublicConfig(requestHeaders = {}) {
       configuredUrl: settings.openclaw.url || "",
       activeUrl: state.openclawTargetUrl,
       connected: state.openclawConnected,
+      lastError: state.openclawLastError || "",
       autoDiscover: settings.openclaw.autoDiscover !== false,
       hasToken: Boolean(token),
       tokenPreview: maskToken(token),
@@ -585,6 +588,7 @@ function connectToOpenClaw() {
 
   ws.on("open", () => {
     state.openclawConnected = true;
+    state.openclawLastError = "";
     state.openclawAttempt = 0;
     log("Connected to OpenClaw:", targetUrl);
     sendSystemMessage(`Hub connected to OpenClaw (${targetUrl})`);
@@ -612,6 +616,7 @@ function connectToOpenClaw() {
     state.openclawConnected = false;
     state.openclawSocket = null;
     const reasonText = reason ? reason.toString() : "";
+    const errorDetail = state.openclawLastError || reasonText;
 
     if (state.openclawManualClose) {
       state.openclawManualClose = false;
@@ -620,13 +625,21 @@ function connectToOpenClaw() {
       return;
     }
 
-    sendSystemMessage(`OpenClaw disconnected (code ${code})`);
+    sendSystemMessage(
+      errorDetail
+        ? `OpenClaw disconnected (code ${code}): ${errorDetail}`
+        : `OpenClaw disconnected (code ${code})`
+    );
     broadcastConfig();
-    log("OpenClaw closed:", `${code} ${reasonText} (${targetUrl})`);
+    log(
+      "OpenClaw closed:",
+      `${code} ${reasonText || state.openclawLastError} (${targetUrl})`
+    );
     scheduleReconnect();
   });
 
   ws.on("error", (error) => {
+    state.openclawLastError = String(error?.message || "unknown OpenClaw error");
     log("OpenClaw error:", error.message);
   });
 }

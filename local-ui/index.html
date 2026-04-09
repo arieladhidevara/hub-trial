@@ -44,13 +44,21 @@
             <input id="sshPortInput" class="field-input" type="number" value="22" min="1" />
           </div>
         </div>
+        <label class="field-label" for="sshPasswordInput">SSH Password (optional)</label>
+        <input
+          id="sshPasswordInput"
+          class="field-input"
+          type="password"
+          placeholder="Isi jika belum pakai SSH key"
+          autocomplete="current-password"
+        />
         <div class="action-row single-row">
           <button id="disconnectTunnelBtn" class="small-btn danger-btn" type="button">
             Disconnect SSH Tunnel
           </button>
         </div>
         <p id="hubConnectHint" class="panel-note">
-          Paste VPS IP/URL, lalu Connect. If SSH tunnel aktif, cukup isi 127.0.0.1
+          Paste VPS IP/host, isi SSH user/password (atau pakai SSH key), lalu Connect.
         </p>
       </section>
 

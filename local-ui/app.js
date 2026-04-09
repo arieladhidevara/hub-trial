@@ -10,6 +10,7 @@ const hubConnectHint = document.getElementById("hubConnectHint");
 const useSshTunnelCheckbox = document.getElementById("useSshTunnelCheckbox");
 const sshUserInput = document.getElementById("sshUserInput");
 const sshPortInput = document.getElementById("sshPortInput");
+const sshPasswordInput = document.getElementById("sshPasswordInput");
 const disconnectTunnelBtn = document.getElementById("disconnectTunnelBtn");
 
 const agentsListEl = document.getElementById("agentsList");
@@ -319,7 +320,7 @@ function renderConfig(config) {
   }
 
   if (!openclawUrlInput.matches(":focus")) {
-    openclawUrlInput.value = openclaw.configuredUrl || openclaw.activeUrl || "";
+    openclawUrlInput.value = openclaw.configuredUrl || "";
   }
 
   const tokenInfo = openclaw.hasToken
@@ -329,7 +330,8 @@ function renderConfig(config) {
   const configuredUrl = openclaw.configuredUrl
     ? `configured: ${openclaw.configuredUrl}`
     : "configured: auto";
-  openclawSummary.textContent = `${configuredUrl} | ${activeUrl} | ${tokenInfo}`;
+  const errorInfo = openclaw.lastError ? `last_error: ${openclaw.lastError}` : "last_error: -";
+  openclawSummary.textContent = `${configuredUrl} | ${activeUrl} | ${tokenInfo} | ${errorInfo}`;
 
   renderDiscovery(openclaw.lastDiscovery?.results || []);
   renderDockerSummary(config?.docker || {});
@@ -345,7 +347,7 @@ function renderTunnelStatus(tunnel) {
     hubConnectHint.textContent = `Tunnel inactive. Last error: ${tunnel.lastError}`;
   } else {
     hubConnectHint.textContent =
-      "Paste VPS IP/URL, lalu Connect. If SSH tunnel aktif, cukup isi 127.0.0.1";
+      "Paste VPS IP/host, isi SSH user/password (atau pakai SSH key), lalu Connect.";
   }
 }
 
@@ -409,7 +411,18 @@ async function saveOpenClawConfig() {
     });
     renderConfig(response.config || {});
     openclawTokenInput.value = "";
-    appendSystem("OpenClaw settings berhasil disimpan.");
+    const dockerPair = response.dockerPair || null;
+    if (dockerPair && dockerPair.ok === false) {
+      appendError(`OpenClaw config tersimpan, tapi auto-pair gagal: ${dockerPair.message || dockerPair.status}`);
+    } else if (dockerPair && dockerPair.ok) {
+      appendSystem(
+        dockerPair.wsUrl
+          ? `OpenClaw settings tersimpan. Auto-pair sukses ke ${dockerPair.wsUrl}.`
+          : "OpenClaw settings tersimpan. Auto-pair sukses."
+      );
+    } else {
+      appendSystem("OpenClaw settings berhasil disimpan.");
+    }
     sendMessage({ type: "request_agents" });
   } catch (error) {
     appendError(`Save config gagal: ${error.message}`);
@@ -577,6 +590,7 @@ function toggleTunnelFields() {
   const enabled = useSshTunnelCheckbox.checked;
   sshUserInput.disabled = !enabled;
   sshPortInput.disabled = !enabled;
+  sshPasswordInput.disabled = !enabled;
   disconnectTunnelBtn.disabled = !enabled;
 }
 
@@ -590,6 +604,7 @@ async function connectHub() {
       const userInput = sshUserInput.value.trim();
       const user = userInput || parsed.userFromInput || "root";
       const sshPortFromField = Number(sshPortInput.value || 22);
+      const sshPassword = sshPasswordInput.value;
       const sshPort =
         Number.isInteger(sshPortFromField) && sshPortFromField > 0
           ? sshPortFromField
@@ -601,6 +616,7 @@ async function connectHub() {
           host: parsed.host,
           user,
           sshPort,
+          password: sshPassword,
           localPort: 18080,
           remotePort: 8080
         }

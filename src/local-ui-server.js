@@ -1,4 +1,5 @@
 const path = require("path");
+const http = require("http");
 const express = require("express");
 const { spawn } = require("child_process");
 
@@ -8,6 +9,9 @@ const AUTO_OPEN = String(process.env.LOCAL_UI_AUTO_OPEN || "true")
   .toLowerCase() !== "false";
 const DEFAULT_LOCAL_TUNNEL_PORT = Number(process.env.LOCAL_UI_TUNNEL_LOCAL_PORT || 18080);
 const DEFAULT_REMOTE_HUB_PORT = Number(process.env.LOCAL_UI_TUNNEL_REMOTE_PORT || 8080);
+const TUNNEL_HEALTH_TIMEOUT_MS = Number(
+  process.env.LOCAL_UI_TUNNEL_HEALTH_TIMEOUT_MS || 6000
+);
 
 const tunnelState = {
   process: null,
@@ -46,6 +50,7 @@ app.post("/api/tunnel/connect", async (req, res) => {
   const body = req.body || {};
   const host = String(body.host || "").trim();
   const user = String(body.user || "root").trim() || "root";
+  const password = String(body.password || "");
   const sshPort = Number(body.sshPort || 22);
   const localPort = Number(body.localPort || DEFAULT_LOCAL_TUNNEL_PORT);
   const remotePort = Number(body.remotePort || DEFAULT_REMOTE_HUB_PORT);
@@ -83,6 +88,7 @@ app.post("/api/tunnel/connect", async (req, res) => {
     const state = await startTunnel({
       host,
       user,
+      password,
       sshPort,
       localPort,
       remotePort
@@ -199,16 +205,33 @@ function startTunnel(config) {
       "-o",
       "ServerAliveCountMax=3",
       "-o",
-      "BatchMode=yes",
-      "-o",
       "StrictHostKeyChecking=accept-new",
       `${config.user}@${config.host}`
     ];
+    const hasPassword = Boolean(String(config.password || "").length);
+    if (hasPassword) {
+      args.splice(
+        args.length - 1,
+        0,
+        "-o",
+        "BatchMode=no",
+        "-o",
+        "PreferredAuthentications=password",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "NumberOfPasswordPrompts=1"
+      );
+    } else {
+      args.splice(args.length - 1, 0, "-o", "BatchMode=yes");
+    }
 
     let settled = false;
     let stderr = "";
+    let passwordSent = false;
+    let passwordPromptSeen = false;
     const child = spawn("ssh", args, {
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: ["pipe", "ignore", "pipe"],
       windowsHide: true
     });
 
@@ -228,7 +251,20 @@ function startTunnel(config) {
     };
 
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      if (!hasPassword || passwordSent) {
+        return;
+      }
+      if (/(password|passphrase).*:/i.test(text)) {
+        passwordPromptSeen = true;
+        passwordSent = true;
+        try {
+          child.stdin.write(`${config.password}\n`);
+        } catch (_error) {
+          // no-op
+        }
+      }
     });
 
     child.on("error", (error) => {
@@ -248,18 +284,104 @@ function startTunnel(config) {
       if (settled) {
         return;
       }
-      settled = true;
-      tunnelState.process = child;
-      tunnelState.active = true;
-      tunnelState.host = config.host;
-      tunnelState.user = config.user;
-      tunnelState.sshPort = config.sshPort;
-      tunnelState.localPort = config.localPort;
-      tunnelState.remotePort = config.remotePort;
-      tunnelState.startedAt = new Date().toISOString();
-      tunnelState.lastError = "";
-      resolve(getTunnelPublicState());
-    }, 1200);
+
+      waitForLocalHubHealth(config.localPort, TUNNEL_HEALTH_TIMEOUT_MS)
+        .then(() => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          tunnelState.process = child;
+          tunnelState.active = true;
+          tunnelState.host = config.host;
+          tunnelState.user = config.user;
+          tunnelState.sshPort = config.sshPort;
+          tunnelState.localPort = config.localPort;
+          tunnelState.remotePort = config.remotePort;
+          tunnelState.startedAt = new Date().toISOString();
+          tunnelState.lastError = "";
+          resolve(getTunnelPublicState());
+        })
+        .catch((error) => {
+          const sshDetails = stderr.trim();
+          const missingPromptHint =
+            hasPassword && !passwordPromptSeen
+              ? " SSH password prompt tidak terdeteksi. Coba login manual sekali untuk trust host key, atau pakai SSH key."
+              : "";
+          const detailText = sshDetails ? ` SSH: ${sshDetails}` : "";
+          fail(`${error.message}${detailText}${missingPromptHint}`);
+        });
+    }, 250);
+  });
+}
+
+function waitForLocalHubHealth(localPort, timeoutMs) {
+  const startedAt = Date.now();
+  const intervalMs = 300;
+  let lastError = "";
+
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      requestLocalHubHealth(localPort, 1200)
+        .then(() => {
+          resolve();
+        })
+        .catch((error) => {
+          lastError = error.message;
+          if (Date.now() - startedAt >= timeoutMs) {
+            reject(
+              new Error(
+                `SSH tunnel hidup tapi Hub tidak reachable di 127.0.0.1:${localPort}/health. Cek docker hub di VPS. Detail: ${lastError}`
+              )
+            );
+            return;
+          }
+          setTimeout(tick, intervalMs);
+        });
+    };
+    tick();
+  });
+}
+
+function requestLocalHubHealth(localPort, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const request = http.get(
+      {
+        host: "127.0.0.1",
+        port: localPort,
+        path: "/health",
+        timeout: timeoutMs
+      },
+      (response) => {
+        let body = "";
+        response.on("data", (chunk) => {
+          body += chunk.toString();
+        });
+        response.on("end", () => {
+          if (response.statusCode !== 200) {
+            reject(new Error(`HTTP ${response.statusCode}`));
+            return;
+          }
+          try {
+            const parsed = JSON.parse(body || "{}");
+            if (parsed && parsed.ok) {
+              resolve();
+              return;
+            }
+          } catch (_error) {
+            // no-op
+          }
+          resolve();
+        });
+      }
+    );
+
+    request.on("timeout", () => {
+      request.destroy(new Error("timeout"));
+    });
+    request.on("error", (error) => {
+      reject(error);
+    });
   });
 }
 

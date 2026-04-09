@@ -221,7 +221,7 @@ function renderConfig(config) {
   }
 
   if (!openclawUrlInput.matches(":focus")) {
-    openclawUrlInput.value = openclaw.configuredUrl || openclaw.activeUrl || "";
+    openclawUrlInput.value = openclaw.configuredUrl || "";
   }
 
   const tokenInfo = openclaw.hasToken
@@ -231,7 +231,8 @@ function renderConfig(config) {
   const configuredUrl = openclaw.configuredUrl
     ? `configured: ${openclaw.configuredUrl}`
     : "configured: auto";
-  openclawSummary.textContent = `${configuredUrl} | ${activeUrl} | ${tokenInfo}`;
+  const errorInfo = openclaw.lastError ? `last_error: ${openclaw.lastError}` : "last_error: -";
+  openclawSummary.textContent = `${configuredUrl} | ${activeUrl} | ${tokenInfo} | ${errorInfo}`;
 
   renderDiscovery(openclaw.lastDiscovery?.results || []);
   renderProxySummary(config?.proxy || {}, config?.proxyContext || {});
@@ -289,7 +290,18 @@ async function saveOpenClawConfig() {
     });
     renderConfig(response.config || {});
     openclawTokenInput.value = "";
-    appendSystem("OpenClaw settings berhasil disimpan.");
+    const dockerPair = response.dockerPair || null;
+    if (dockerPair && dockerPair.ok === false) {
+      appendError(`OpenClaw config tersimpan, tapi auto-pair gagal: ${dockerPair.message || dockerPair.status}`);
+    } else if (dockerPair && dockerPair.ok) {
+      appendSystem(
+        dockerPair.wsUrl
+          ? `OpenClaw settings tersimpan. Auto-pair sukses ke ${dockerPair.wsUrl}.`
+          : "OpenClaw settings tersimpan. Auto-pair sukses."
+      );
+    } else {
+      appendSystem("OpenClaw settings berhasil disimpan.");
+    }
     sendMessage({ type: "request_agents" });
   } catch (error) {
     appendError(`Save config gagal: ${error.message}`);
